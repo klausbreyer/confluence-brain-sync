@@ -101,9 +101,6 @@ defmodule SyncConfluence.Util do
       page_id = query_params["pageId"] ->
         page_id
 
-      homepage_id = query_params["homepageId"] ->
-        homepage_id
-
       match = Regex.run(~r{/pages/(\d+)(?:/|$)}, path || "") ->
         Enum.at(match, 1)
 
@@ -216,13 +213,7 @@ defmodule SyncConfluence.Client do
 
       Logger.log("Fetching #{length(page_ids)} page bodies for root #{root_page_id}...", verbose)
 
-      pages =
-        Enum.reduce_while(page_ids, %{}, fn page_id, acc ->
-          case fetch_page(client, page_id) do
-            {:ok, page} -> {:cont, Map.put(acc, page_id, page)}
-            {:error, reason} -> {:halt, {:error, reason}}
-          end
-        end)
+      pages = fetch_pages_map(client, page_ids, verbose, allow_missing: true)
 
       case pages do
         {:error, reason} ->
@@ -248,6 +239,9 @@ defmodule SyncConfluence.Client do
                   |> Map.merge(page)
                   |> Map.put(:root_parent_id, root_page_id)
               end
+            end)
+            |> Enum.filter(fn node ->
+              node.type != "page" or Map.has_key?(node, :storage_value)
             end)
 
           {:ok, nodes}
@@ -278,68 +272,10 @@ defmodule SyncConfluence.Client do
     end
   end
 
-  def fetch_space_target_tree(client, target, verbose) do
-    with {:ok, homepage} <- fetch_page(client, target.page_id),
-         {:ok, space_pages} <- fetch_space_pages(client, homepage.space_id, verbose) do
-      page_ids =
-        space_pages
-        |> Enum.map(& &1["id"])
-        |> Kernel.++([homepage.id])
-        |> Enum.uniq()
-
-      Logger.log("Fetching #{length(page_ids)} page bodies for space #{homepage.space_id}...", verbose)
-
-      pages =
-        Enum.reduce_while(page_ids, %{}, fn page_id, acc ->
-          case fetch_page(client, page_id) do
-            {:ok, page} -> {:cont, Map.put(acc, page_id, page)}
-            {:error, reason} -> {:halt, {:error, reason}}
-          end
-        end)
-
-      case pages do
-        {:error, reason} ->
-          {:error, reason}
-
-        page_map ->
-          page_ids_in_space = Map.keys(page_map) |> MapSet.new()
-
-          synthetic_root = target_root_node(target)
-
-          adjusted_nodes =
-            page_map
-            |> Map.values()
-            |> Enum.map(fn page ->
-              normalized_parent_id =
-                if page.parent_type == "page" and page.parent_id && MapSet.member?(page_ids_in_space, page.parent_id) do
-                  page.parent_id
-                else
-                  target.id
-                end
-
-              page
-              |> Map.put(:root_parent_id, target.id)
-              |> Map.put(:parent_id, normalized_parent_id)
-            end)
-
-          {:ok, [synthetic_root | adjusted_nodes]}
-      end
-    end
-  end
-
   def fetch_descendants(client, page_id, verbose) do
     paginate_json(
       client,
       "/wiki/api/v2/pages/#{page_id}/descendants",
-      [limit: 100],
-      verbose
-    )
-  end
-
-  def fetch_space_pages(client, space_id, verbose) do
-    paginate_json(
-      client,
-      "/wiki/api/v2/spaces/#{space_id}/pages",
       [limit: 100],
       verbose
     )
@@ -369,6 +305,29 @@ defmodule SyncConfluence.Client do
       {:error, reason} ->
         {:error, "Could not fetch page #{page_id}: #{reason}"}
     end
+  end
+
+  defp fetch_pages_map(client, page_ids, _verbose, opts) do
+    allow_missing = Keyword.get(opts, :allow_missing, false)
+
+    Enum.reduce_while(page_ids, %{}, fn page_id, acc ->
+      case fetch_page(client, page_id) do
+        {:ok, page} ->
+          {:cont, Map.put(acc, page_id, page)}
+
+        {:error, reason} ->
+          if allow_missing and missing_page_error?(reason) do
+            Logger.log("Skipping missing or inaccessible child page #{page_id}: #{reason}", true)
+            {:cont, acc}
+          else
+            {:halt, {:error, reason}}
+          end
+      end
+    end)
+  end
+
+  defp missing_page_error?(reason) when is_binary(reason) do
+    String.contains?(reason, "HTTP 404")
   end
 
   def convert_storage_to_export_view(client, page_id, storage_html) do
@@ -979,27 +938,17 @@ defmodule SyncConfluence do
 
     summary =
       Enum.reduce(targets, %{written: 0}, fn target, summary_acc ->
-        target_kind = if target.type == :space, do: "space", else: "page"
-        child_note = if target.type == :page and target.include_children, do: "with child pages", else: "without child pages"
+        child_note = if target.include_children, do: "with child pages", else: "without child pages"
 
         Logger.log(
-          "Target #{target.output_dir}: #{target.source} (#{target_kind}#{if target.type == :page, do: ", #{child_note}", else: ""})",
+          "Target #{target.output_dir}: #{target.source} (page, #{child_note})",
           true
         )
 
         nodes =
-          case target.type do
-            :page ->
-              case Client.fetch_page_target_tree(client, target, verbose) do
-                {:ok, fetched_nodes} -> fetched_nodes
-                {:error, reason} -> raise reason
-              end
-
-            :space ->
-              case Client.fetch_space_target_tree(client, target, verbose) do
-                {:ok, fetched_nodes} -> fetched_nodes
-                {:error, reason} -> raise reason
-              end
+          case Client.fetch_page_target_tree(client, target, verbose) do
+            {:ok, fetched_nodes} -> fetched_nodes
+            {:error, reason} -> raise reason
           end
 
         sync_target_nodes(nodes, output_dir, client, verbose, summary_acc)
@@ -1044,16 +993,7 @@ defmodule SyncConfluence do
   end
 
   defp normalize_target!(%{} = target, index, config) do
-    type =
-      target
-      |> target_value(:type, "page")
-      |> to_string()
-      |> String.downcase()
-      |> case do
-        "page" -> :page
-        "space" -> :space
-        other -> raise "Unsupported sync target type #{inspect(other)} in #{config.config_file_name}."
-      end
+    ensure_page_target!(target, config)
 
     source =
       target_value(target, :source, nil) ||
@@ -1075,7 +1015,6 @@ defmodule SyncConfluence do
 
     %{
       id: "target:#{index}:#{output_dir}",
-      type: type,
       source: source,
       page_id: page_id,
       output_dir: output_dir,
@@ -1151,6 +1090,14 @@ defmodule SyncConfluence do
     raise "Expected #{key_name} to be a boolean in #{config.config_file_name}, got: #{inspect(value)}"
   end
 
+  defp ensure_page_target!(target, config) do
+    type = target_value(target, :type, "page") |> to_string() |> String.downcase()
+
+    if type != "page" do
+      raise "Space sync has been removed. Please use only page targets in #{config.config_file_name}."
+    end
+  end
+
   defp reset_directory!(path) do
     File.rm_rf!(path)
     File.mkdir_p!(path)
@@ -1204,7 +1151,7 @@ defmodule SyncConfluence do
       - Put credentials and defaults into #{config.config_file_name}, next to this script.
       - You can start from #{Path.basename(config.example_config_file_path)}.
       - Define multiple configured sync targets via sync_targets in the config file.
-      - Each target supports type (:page or :space), source, output_dir, and include_children.
+      - Each target supports source, output_dir, and include_children.
       - Edit local_sync_dir in the config file to choose the local sync folder.
       - local_sync_dir is resolved relative to the directory where you run the script.
       - Each target writes flat Markdown files directly into its target folder, no index.md structure.

@@ -1,25 +1,40 @@
 Mix.install([
   {:req, "~> 0.5"},
-  {:floki, "~> 0.37"},
-  {:jason, "~> 1.4"}
+  {:floki, "~> 0.37"}
 ])
 
-# WARNING:
-# This script keeps your Confluence credentials in plain text on purpose,
-# because that is what you asked for. Do not commit this file with real values.
-confluence_base_url = "https://your-site.atlassian.net"
-confluence_email = "you@example.com"
-confluence_api_token = "replace-me"
-# Relative to the directory where you run: `elixir sync_confluence.exs`
-local_sync_dir = "./export"
-sync_child_pages = true
+config_file_name = "sync_confluence.local.exs"
+script_dir = __ENV__.file |> Path.expand() |> Path.dirname()
+config_file_path = Path.join(script_dir, config_file_name)
+example_config_file_path = Path.join(script_dir, "sync_confluence.local.example.exs")
+
+raw_config =
+  cond do
+    File.exists?(config_file_path) ->
+      case Code.eval_file(config_file_path) do
+        {%{} = map, _binding} -> map
+        {list, _binding} when is_list(list) -> Map.new(list)
+        {other, _binding} -> raise "Expected #{config_file_name} to return a map or keyword list, got: #{inspect(other)}"
+      end
+
+    true ->
+      %{}
+  end
+
+fetch_config = fn key, default ->
+  Map.get(raw_config, key) || Map.get(raw_config, Atom.to_string(key)) || default
+end
 
 config = %{
-  confluence_base_url: String.trim_trailing(confluence_base_url, "/"),
-  confluence_email: String.trim(confluence_email),
-  confluence_api_token: String.trim(confluence_api_token),
-  local_sync_dir: local_sync_dir,
-  sync_child_pages: sync_child_pages
+  config_file_name: config_file_name,
+  config_file_path: config_file_path,
+  example_config_file_path: example_config_file_path,
+  config_file_exists?: File.exists?(config_file_path),
+  confluence_base_url: fetch_config.(:confluence_base_url, "https://your-site.atlassian.net") |> to_string() |> String.trim_trailing("/"),
+  confluence_email: fetch_config.(:confluence_email, "you@example.com") |> to_string() |> String.trim(),
+  confluence_api_token: fetch_config.(:confluence_api_token, "replace-me") |> to_string() |> String.trim(),
+  local_sync_dir: fetch_config.(:local_sync_dir, "./export") |> to_string(),
+  sync_child_pages: fetch_config.(:sync_child_pages, true)
 }
 
 defmodule SyncConfluence.Util do
@@ -911,14 +926,22 @@ defmodule SyncConfluence do
 
   defp ensure_config!(config) do
     cond do
+      not config.config_file_exists? ->
+        raise """
+        Missing config file: #{config.config_file_path}
+
+        Create it next to sync_confluence.exs. You can start from:
+        #{config.example_config_file_path}
+        """
+
       config.confluence_base_url in ["", "https://your-site.atlassian.net"] ->
-        raise "Please set confluence_base_url at the top of sync_confluence.exs."
+        raise "Please set confluence_base_url in #{config.config_file_name}."
 
       config.confluence_email in ["", "you@example.com"] ->
-        raise "Please set confluence_email at the top of sync_confluence.exs."
+        raise "Please set confluence_email in #{config.config_file_name}."
 
       config.confluence_api_token in ["", "replace-me"] ->
-        raise "Please set confluence_api_token at the top of sync_confluence.exs."
+        raise "Please set confluence_api_token in #{config.config_file_name}."
 
       true ->
         :ok
@@ -938,13 +961,17 @@ defmodule SyncConfluence do
     Usage:
       elixir sync_confluence.exs --parent <url-or-page-id> [--parent <url-or-page-id> ...] [--out <dir>] [--with-children|--without-children] [--verbose]
 
+    Config file:
+      #{config.config_file_path}
+
     Defaults:
       local_sync_dir   #{config.local_sync_dir}
       child_pages      #{config.sync_child_pages}
 
     Notes:
-      - Edit the Confluence credentials at the top of this script before running it.
-      - Edit local_sync_dir at the top of the script to choose the local sync folder.
+      - Put credentials and defaults into #{config.config_file_name}, next to this script.
+      - You can start from #{Path.basename(config.example_config_file_path)}.
+      - Edit local_sync_dir in the config file to choose the local sync folder.
       - local_sync_dir is resolved relative to the directory where you run the script.
       - Page links inside the synced subtree are rewritten to relative Markdown paths.
       - Existing files at the same target paths are overwritten on every run.

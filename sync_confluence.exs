@@ -547,33 +547,19 @@ defmodule SyncConfluence.Tree do
       page_nodes
       |> Enum.frequencies_by(& &1.root_parent_id)
 
-    configured_output_dirs =
-      roots
-      |> Enum.map(fn root -> {root.id, Map.get(root, :output_dir)} end)
-      |> Enum.reject(fn {_id, dir} -> is_nil(dir) or dir == "" end)
-
-    configured_output_dir_counts =
-      configured_output_dirs
-      |> Enum.map(fn {_id, dir} -> dir end)
-      |> Enum.frequencies()
-
     root_dirs =
       roots
       |> Enum.map(fn root ->
         page_count = Map.get(page_counts_by_root, root.id, 0)
         configured_output_dir = Map.get(root, :output_dir)
-        configured_dir_shared? = configured_output_dir && Map.get(configured_output_dir_counts, configured_output_dir, 0) > 1
 
         relative_dir =
           cond do
-            page_count > 1 and configured_output_dir not in [nil, ""] ->
+            configured_output_dir not in [nil, ""] ->
               configured_output_dir
 
             page_count > 1 ->
               Util.slugify(root.title)
-
-            configured_dir_shared? ->
-              configured_output_dir
 
             true ->
               ""
@@ -1145,7 +1131,18 @@ defmodule SyncConfluence do
   end
 
   defp target_value(target, key, default) do
-    Map.get(target, key) || Map.get(target, Atom.to_string(key)) || default
+    string_key = Atom.to_string(key)
+
+    cond do
+      Map.has_key?(target, key) ->
+        Map.get(target, key)
+
+      Map.has_key?(target, string_key) ->
+        Map.get(target, string_key)
+
+      true ->
+        default
+    end
   end
 
   defp normalize_boolean!(value, _key_name, _config) when is_boolean(value), do: value

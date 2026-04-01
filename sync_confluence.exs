@@ -1,0 +1,956 @@
+Mix.install([
+  {:req, "~> 0.5"},
+  {:floki, "~> 0.37"},
+  {:jason, "~> 1.4"}
+])
+
+# WARNING:
+# This script keeps your Confluence credentials in plain text on purpose,
+# because that is what you asked for. Do not commit this file with real values.
+confluence_base_url = "https://your-site.atlassian.net"
+confluence_email = "you@example.com"
+confluence_api_token = "replace-me"
+# Relative to the directory where you run: `elixir sync_confluence.exs`
+local_sync_dir = "./export"
+sync_child_pages = true
+
+config = %{
+  confluence_base_url: String.trim_trailing(confluence_base_url, "/"),
+  confluence_email: String.trim(confluence_email),
+  confluence_api_token: String.trim(confluence_api_token),
+  local_sync_dir: local_sync_dir,
+  sync_child_pages: sync_child_pages
+}
+
+defmodule SyncConfluence.Util do
+  def slugify(nil), do: "untitled"
+
+  def slugify(value) do
+    value
+    |> String.normalize(:nfd)
+    |> String.downcase()
+    |> String.replace(~r/\p{Mn}/u, "")
+    |> String.replace(~r/[^a-z0-9]+/u, "-")
+    |> String.trim("-")
+    |> case do
+      "" -> "untitled"
+      slug -> slug
+    end
+  end
+
+  def parse_page_id(value) when is_binary(value) do
+    trimmed = String.trim(value)
+
+    cond do
+      trimmed == "" ->
+        {:error, "Parent value is empty."}
+
+      String.match?(trimmed, ~r/^\d+$/) ->
+        {:ok, trimmed}
+
+      true ->
+        parse_page_id_from_url(trimmed)
+    end
+  end
+
+  def parse_page_id_from_url(url) do
+    with %URI{} = uri <- URI.parse(url),
+         id when is_binary(id) <- page_id_from_uri(uri) do
+      {:ok, id}
+    else
+      _ -> {:error, "Could not extract a Confluence page ID from #{inspect(url)}."}
+    end
+  end
+
+  def page_id_from_uri(%URI{query: query, path: path}) do
+    query_params = URI.decode_query(query || "")
+
+    cond do
+      page_id = query_params["pageId"] ->
+        page_id
+
+      match = Regex.run(~r{/pages/(\d+)(?:/|$)}, path || "") ->
+        Enum.at(match, 1)
+
+      match = Regex.run(~r{/spaces/[^/]+/pages/(\d+)(?:/|$)}, path || "") ->
+        Enum.at(match, 1)
+
+      true ->
+        nil
+    end
+  end
+
+  def relative_link(from_path, to_path) do
+    from_dir = Path.dirname(from_path)
+    Path.relative_to(to_path, from_dir)
+  end
+
+  def ensure_directory(path) do
+    path |> Path.dirname() |> File.mkdir_p!()
+  end
+
+  def yaml_frontmatter(metadata) do
+    lines =
+      metadata
+      |> Enum.map(fn {key, value} ->
+        "#{key}: #{yaml_scalar(value)}"
+      end)
+      |> Enum.join("\n")
+
+    "---\n" <> lines <> "\n---\n\n"
+  end
+
+  defp yaml_scalar(nil), do: "null"
+  defp yaml_scalar(true), do: "true"
+  defp yaml_scalar(false), do: "false"
+  defp yaml_scalar(value) when is_integer(value), do: Integer.to_string(value)
+
+  defp yaml_scalar(value) when is_binary(value) do
+    escaped =
+      value
+      |> String.replace("\\", "\\\\")
+      |> String.replace("\"", "\\\"")
+      |> String.replace("\n", "\\n")
+
+    "\"#{escaped}\""
+  end
+  def normalize_markdown(markdown) do
+    markdown
+    |> String.replace("\r\n", "\n")
+    |> String.replace(~r/\n{3,}/, "\n\n")
+    |> String.trim()
+    |> Kernel.<>("\n")
+  end
+
+  def header_value(headers, name) do
+    normalized_name = String.downcase(name)
+
+    headers
+    |> Enum.find_value(fn
+      {header_name, value} when is_binary(header_name) ->
+        if String.downcase(header_name) == normalized_name, do: value, else: nil
+
+      _ ->
+        nil
+    end)
+  end
+end
+
+defmodule SyncConfluence.Logger do
+  def log(message, verbose \\ true) do
+    if verbose, do: IO.puts(message)
+  end
+end
+
+defmodule SyncConfluence.Client do
+  alias SyncConfluence.Logger
+  alias SyncConfluence.Util
+
+  def new(config) do
+    auth =
+      Base.encode64("#{config.confluence_email}:#{config.confluence_api_token}")
+
+    %{
+      base_url: config.confluence_base_url,
+      req:
+        Req.new(
+          base_url: config.confluence_base_url,
+          headers: [
+            {"accept", "application/json"},
+            {"authorization", "Basic #{auth}"},
+            {"content-type", "application/json"}
+          ],
+          connect_options: [timeout: 30_000],
+          receive_timeout: 120_000
+        )
+    }
+  end
+
+  def fetch_tree(client, root_page_id, include_children, verbose) do
+    with {:ok, _root_page} <- fetch_page(client, root_page_id),
+         {:ok, descendants} <- maybe_fetch_descendants(client, root_page_id, include_children, verbose) do
+      descendant_nodes =
+        descendants
+        |> Enum.map(&normalize_descendant(&1, root_page_id))
+
+      page_ids =
+        [%{id: root_page_id, type: "page"} | descendant_nodes]
+        |> Enum.filter(&(&1.type == "page"))
+        |> Enum.map(& &1.id)
+        |> Enum.uniq()
+
+      Logger.log("Fetching #{length(page_ids)} page bodies for root #{root_page_id}...", verbose)
+
+      pages =
+        Enum.reduce_while(page_ids, %{}, fn page_id, acc ->
+          case fetch_page(client, page_id) do
+            {:ok, page} -> {:cont, Map.put(acc, page_id, page)}
+            {:error, reason} -> {:halt, {:error, reason}}
+          end
+        end)
+
+      case pages do
+        {:error, reason} ->
+          {:error, reason}
+
+        page_map ->
+          root_node =
+            page_map
+            |> Map.fetch!(root_page_id)
+            |> Map.put(:root_parent_id, root_page_id)
+            |> Map.put(:depth, 0)
+            |> Map.put(:child_position, 0)
+
+          nodes =
+            [root_node | descendant_nodes]
+            |> Enum.map(fn node ->
+              case Map.get(page_map, node.id) do
+                nil ->
+                  Map.put(node, :root_parent_id, root_page_id)
+
+                page ->
+                  node
+                  |> Map.merge(page)
+                  |> Map.put(:root_parent_id, root_page_id)
+              end
+            end)
+
+          {:ok, nodes}
+      end
+    end
+  end
+
+  def fetch_descendants(client, page_id, verbose) do
+    paginate_json(
+      client,
+      "/wiki/api/v2/pages/#{page_id}/descendants",
+      [limit: 100],
+      verbose
+    )
+  end
+
+  def fetch_page(client, page_id) do
+    case request_json(
+           client,
+           :get,
+           "/wiki/api/v2/pages/#{page_id}",
+           params: [{"body-format", "storage"}, {"include-version", "true"}]
+         ) do
+      {:ok, body, _response} ->
+        {:ok,
+         %{
+           id: body["id"],
+           type: "page",
+           title: body["title"],
+           parent_id: body["parentId"],
+           parent_type: body["parentType"],
+           space_id: body["spaceId"],
+           version: get_in(body, ["version", "number"]),
+           storage_value: get_in(body, ["body", "storage", "value"]) || "",
+           source_url: source_url(client.base_url, body["id"], body["_links"] || %{})
+         }}
+
+      {:error, reason} ->
+        {:error, "Could not fetch page #{page_id}: #{reason}"}
+    end
+  end
+
+  def convert_storage_to_export_view(client, page_id, storage_html) do
+    payload = %{
+      "value" => storage_html,
+      "representation" => "storage"
+    }
+
+    with {:ok, %{"asyncId" => async_id}, _response} <-
+           request_json(
+             client,
+             :post,
+             "/wiki/rest/api/contentbody/convert/async/export_view",
+             params: [{"contentIdContext", page_id}],
+             json: payload
+           ) do
+      poll_conversion(client, async_id, 20)
+    else
+      {:ok, other, _response} ->
+        {:error, "Unexpected conversion response for page #{page_id}: #{inspect(other)}"}
+
+      {:error, reason} ->
+        {:error, "Could not start conversion for page #{page_id}: #{reason}"}
+    end
+  end
+
+  defp poll_conversion(_client, _async_id, 0) do
+    {:error, "Timed out while waiting for Confluence content body conversion."}
+  end
+
+  defp poll_conversion(client, async_id, attempts_left) do
+    case request_json(client, :get, "/wiki/rest/api/contentbody/convert/async/#{async_id}") do
+      {:ok, %{"value" => html}, _response} when is_binary(html) ->
+        {:ok, html}
+
+      {:ok, %{"status" => status}, _response} when status in ["WORKING", "QUEUED"] ->
+        Process.sleep(500)
+        poll_conversion(client, async_id, attempts_left - 1)
+
+      {:ok, %{"error" => error}, _response} ->
+        {:error, "Confluence conversion failed: #{error}"}
+
+      {:ok, body, _response} ->
+        {:error, "Unexpected conversion poll payload: #{inspect(body)}"}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp paginate_json(client, initial_url, initial_params, verbose) do
+    do_paginate_json(client, initial_url, initial_params, verbose, [])
+  end
+
+  defp maybe_fetch_descendants(_client, _page_id, false, _verbose), do: {:ok, []}
+  defp maybe_fetch_descendants(client, page_id, true, verbose), do: fetch_descendants(client, page_id, verbose)
+
+  defp do_paginate_json(client, url, params, verbose, acc) do
+    case request_json(client, :get, url, params: params) do
+      {:ok, %{"results" => results} = body, _response} ->
+        Logger.log("Fetched #{length(results)} items from #{url}.", verbose)
+
+        case get_in(body, ["_links", "next"]) do
+          next when is_binary(next) and next != "" ->
+            do_paginate_json(client, next, [], verbose, acc ++ results)
+
+          _ ->
+            {:ok, acc ++ results}
+        end
+
+      {:ok, other, _response} ->
+        {:error, "Unexpected pagination payload from #{url}: #{inspect(other)}"}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp request_json(client, method, url, opts \\ [], retries_left \\ 4)
+
+  defp request_json(client, method, url, opts, retries_left) do
+    request_opts = Keyword.merge([method: method, url: url], opts)
+
+    case Req.request(client.req, request_opts) do
+      {:ok, %Req.Response{status: status} = response} when status in 200..299 ->
+        {:ok, response.body, response}
+
+      {:ok, %Req.Response{status: 429} = response} ->
+        retry_after(response.headers, retries_left, fn ->
+          request_json(client, method, url, opts, retries_left - 1)
+        end)
+
+      {:ok, %Req.Response{status: status}} when status >= 500 and retries_left > 0 ->
+        Process.sleep(backoff_ms(retries_left))
+        request_json(client, method, url, opts, retries_left - 1)
+
+      {:ok, %Req.Response{status: status, body: body}} ->
+        {:error, "HTTP #{status}: #{inspect(body)}"}
+
+      {:error, _exception} when retries_left > 0 ->
+        Process.sleep(backoff_ms(retries_left))
+        request_json(client, method, url, opts, retries_left - 1)
+
+      {:error, exception} ->
+        {:error, Exception.message(exception)}
+    end
+  end
+
+  defp retry_after(headers, retries_left, next_request) when retries_left > 0 do
+    wait_ms =
+      headers
+      |> Util.header_value("retry-after")
+      |> case do
+        nil -> backoff_ms(retries_left)
+        value ->
+          case Integer.parse(value) do
+            {seconds, _rest} -> max(seconds, 1) * 1_000
+            :error -> backoff_ms(retries_left)
+          end
+      end
+
+    Process.sleep(wait_ms)
+    next_request.()
+  end
+
+  defp retry_after(_headers, _retries_left, _next_request) do
+    {:error, "Confluence rate limited the request too many times."}
+  end
+
+  defp backoff_ms(retries_left) do
+    trunc(:math.pow(2, 5 - retries_left) * 500)
+  end
+
+  defp source_url(base_url, page_id, links) do
+    case links["webui"] do
+      path when is_binary(path) ->
+        URI.merge(base_url, path) |> to_string()
+
+      _ ->
+        "#{base_url}/wiki/pages/viewpage.action?pageId=#{page_id}"
+    end
+  end
+
+  defp normalize_descendant(node, root_parent_id) do
+    %{
+      id: node["id"],
+      type: node["type"],
+      title: node["title"] || "#{String.capitalize(node["type"] || "item")} #{node["id"]}",
+      parent_id: node["parentId"],
+      depth: node["depth"] || 0,
+      child_position: node["childPosition"] || 0,
+      root_parent_id: root_parent_id
+    }
+  end
+end
+
+defmodule SyncConfluence.Tree do
+  alias SyncConfluence.Util
+
+  def enrich_paths(nodes, output_dir) do
+    roots = Enum.filter(nodes, &(&1.id == &1.root_parent_id))
+    root_slugs = assign_root_slugs(roots)
+
+    nodes_by_key =
+      nodes
+      |> Enum.map(fn node -> {{node.root_parent_id, node.id}, node} end)
+      |> Map.new()
+
+    sibling_slug_map =
+      nodes
+      |> Enum.group_by(fn node ->
+        {node.root_parent_id, sibling_parent_key(node)}
+      end)
+      |> Enum.flat_map(fn {{root_parent_id, parent_key}, siblings} ->
+        assign_sibling_slugs(root_parent_id, parent_key, siblings)
+      end)
+      |> Map.new()
+
+    nodes
+    |> Enum.map(fn node ->
+      dir_parts = build_dir_parts(node, nodes_by_key, root_slugs, sibling_slug_map)
+      relative_dir = Path.join(dir_parts)
+      relative_path = Path.join(relative_dir, "index.md")
+
+      node
+      |> Map.put(:slug, Map.fetch!(sibling_slug_map, {node.root_parent_id, node.id}))
+      |> Map.put(:relative_dir, relative_dir)
+      |> Map.put(:relative_path, relative_path)
+      |> Map.put(:absolute_path, Path.join(output_dir, relative_path))
+    end)
+  end
+
+  def sibling_parent_key(node) do
+    if node.id == node.root_parent_id, do: :__root__, else: node.parent_id || :__root__
+  end
+
+  defp assign_root_slugs(roots) do
+    assign_slug_values(roots)
+    |> Enum.map(fn {id, slug} -> {{id, :__root__}, slug} end)
+    |> Map.new()
+  end
+
+  defp assign_sibling_slugs(root_parent_id, _parent_key, siblings) do
+    assign_slug_values(siblings)
+    |> Enum.map(fn {id, slug} -> {{root_parent_id, id}, slug} end)
+  end
+
+  defp assign_slug_values(nodes) do
+    base_slugs =
+      Enum.map(nodes, fn node ->
+        {node.id, Util.slugify(node.title)}
+      end)
+
+    counts =
+      base_slugs
+      |> Enum.frequencies_by(fn {_id, slug} -> slug end)
+
+    Enum.map(base_slugs, fn {id, base_slug} ->
+      slug =
+        if Map.get(counts, base_slug, 0) > 1 do
+          "#{base_slug}-#{id}"
+        else
+          base_slug
+        end
+
+      {id, slug}
+    end)
+  end
+
+  defp build_dir_parts(node, nodes_by_key, root_slugs, sibling_slug_map) do
+    do_build_dir_parts(node, nodes_by_key, root_slugs, sibling_slug_map, MapSet.new())
+  end
+
+  defp do_build_dir_parts(node, _nodes_by_key, root_slugs, _sibling_slug_map, _visited)
+       when node.id == node.root_parent_id do
+    [Map.fetch!(root_slugs, {node.root_parent_id, :__root__})]
+  end
+
+  defp do_build_dir_parts(node, nodes_by_key, root_slugs, sibling_slug_map, visited) do
+    key = {node.root_parent_id, node.id}
+
+    if MapSet.member?(visited, key) do
+      [Map.fetch!(root_slugs, {node.root_parent_id, :__root__}), Map.fetch!(sibling_slug_map, key)]
+    else
+      parent =
+        Map.get(nodes_by_key, {node.root_parent_id, node.parent_id}) ||
+          Map.get(nodes_by_key, {node.root_parent_id, node.root_parent_id})
+
+      parent_parts =
+        do_build_dir_parts(parent, nodes_by_key, root_slugs, sibling_slug_map, MapSet.put(visited, key))
+
+      parent_parts ++ [Map.fetch!(sibling_slug_map, key)]
+    end
+  end
+end
+
+defmodule SyncConfluence.Markdown do
+  alias SyncConfluence.Util
+
+  def from_html(html, current_page, local_pages_by_id) do
+    {:ok, nodes} = Floki.parse_fragment(html)
+
+    nodes
+    |> Enum.map(&render_node(&1, %{page: current_page, pages_by_id: local_pages_by_id, list_depth: 0}))
+    |> Enum.join()
+    |> postprocess_markdown()
+  end
+
+  defp render_node(text, _ctx) when is_binary(text) do
+    text
+    |> String.replace(~r/\s+/u, " ")
+  end
+
+  defp render_node({"br", _attrs, _children}, _ctx), do: "  \n"
+  defp render_node({"hr", _attrs, _children}, _ctx), do: "\n\n---\n\n"
+
+  defp render_node({"h" <> level, _attrs, children}, ctx) when level in ["1", "2", "3", "4", "5", "6"] do
+    heading = String.duplicate("#", String.to_integer(level))
+    "\n\n#{heading} #{inline(children, ctx)}\n\n"
+  end
+
+  defp render_node({"p", _attrs, children}, ctx) do
+    content = inline(children, ctx)
+    if content == "", do: "", else: "\n\n#{content}\n\n"
+  end
+
+  defp render_node({"strong", _attrs, children}, ctx), do: wrap_inline("**", children, ctx)
+  defp render_node({"b", _attrs, children}, ctx), do: wrap_inline("**", children, ctx)
+  defp render_node({"em", _attrs, children}, ctx), do: wrap_inline("*", children, ctx)
+  defp render_node({"i", _attrs, children}, ctx), do: wrap_inline("*", children, ctx)
+
+  defp render_node({"code", _attrs, children}, _ctx) do
+    text = Floki.text(children) |> String.trim()
+    if text == "", do: "", else: "`#{text}`"
+  end
+
+  defp render_node({"pre", _attrs, children}, _ctx) do
+    code =
+      children
+      |> Floki.text(sep: "")
+      |> String.trim("\n")
+
+    "\n\n```\n#{code}\n```\n\n"
+  end
+
+  defp render_node({"blockquote", _attrs, children}, ctx) do
+    body =
+      children
+      |> Enum.map(&render_node(&1, ctx))
+      |> Enum.join()
+      |> String.trim()
+      |> String.split("\n")
+      |> Enum.map_join("\n", fn line ->
+        if String.trim(line) == "", do: ">", else: "> #{line}"
+      end)
+
+    "\n\n#{body}\n\n"
+  end
+
+  defp render_node({"ul", _attrs, children}, ctx) do
+    render_list(children, ctx, :unordered)
+  end
+
+  defp render_node({"ol", _attrs, children}, ctx) do
+    render_list(children, ctx, :ordered)
+  end
+
+  defp render_node({"a", attrs, children}, ctx) do
+    href = attr(attrs, "href")
+    text = inline(children, ctx)
+    label = if text == "", do: href || "", else: text
+
+    case rewrite_href(href, ctx) do
+      nil -> label
+      rewritten -> "[#{label}](#{rewritten})"
+    end
+  end
+
+  defp render_node({"img", attrs, _children}, _ctx) do
+    src = attr(attrs, "src")
+    alt = attr(attrs, "alt") || ""
+
+    if src do
+      "![#{alt}](#{src})"
+    else
+      ""
+    end
+  end
+
+  defp render_node({"table", _attrs, children}, _ctx) do
+    rows =
+      Floki.find(children, "tr")
+      |> Enum.map(fn {"tr", _tr_attrs, cells} ->
+        cells
+        |> Enum.filter(fn
+          {tag, _, _} when tag in ["th", "td"] -> true
+          _ -> false
+        end)
+        |> Enum.map(fn {_tag, _attrs, cell_children} ->
+          cell_children
+          |> Floki.text(sep: " ")
+          |> String.replace(~r/\s+/u, " ")
+          |> String.trim()
+        end)
+      end)
+      |> Enum.reject(&Enum.empty?/1)
+
+    case rows do
+      [] ->
+        ""
+
+      [header | rest] ->
+        separator = Enum.map_join(header, " | ", fn _ -> "---" end)
+        body_rows = Enum.map_join(rest, "\n", &("| " <> Enum.join(&1, " | ") <> " |"))
+        rows_markdown = if(body_rows == "", do: "", else: body_rows <> "\n")
+
+        "\n\n| #{Enum.join(header, " | ")} |\n| #{separator} |\n#{rows_markdown}\n"
+    end
+  end
+
+  defp render_node({tag, _attrs, children}, ctx)
+       when tag in ["div", "span", "section", "article", "main", "body", "html", "header", "footer", "nav"] do
+    children
+    |> Enum.map(&render_node(&1, ctx))
+    |> Enum.join()
+  end
+
+  defp render_node({_tag, _attrs, children}, ctx) do
+    children
+    |> Enum.map(&render_node(&1, ctx))
+    |> Enum.join()
+  end
+
+  defp wrap_inline(wrapper, children, ctx) do
+    content = inline(children, ctx)
+    if content == "", do: "", else: "#{wrapper}#{content}#{wrapper}"
+  end
+
+  defp inline(children, ctx) do
+    children
+    |> Enum.map(&render_node(&1, ctx))
+    |> Enum.join()
+    |> String.replace(~r/\s+/u, " ")
+    |> String.trim()
+  end
+
+  defp render_list(children, ctx, mode) do
+    items =
+      children
+      |> Enum.filter(fn
+        {"li", _, _} -> true
+        _ -> false
+      end)
+
+    list_ctx = %{ctx | list_depth: ctx.list_depth + 1}
+
+    rendered =
+      items
+      |> Enum.with_index(1)
+      |> Enum.map(fn
+        {{"li", _attrs, li_children}, index} ->
+          marker =
+            case mode do
+              :unordered -> "- "
+              :ordered -> "#{index}. "
+            end
+
+          content =
+            li_children
+            |> Enum.map(&render_node(&1, list_ctx))
+            |> Enum.join()
+            |> String.trim()
+
+          indent = String.duplicate("  ", ctx.list_depth)
+          lines = String.split(content, "\n")
+
+          case lines do
+            [] ->
+              "#{indent}#{marker}"
+
+            [first | rest] ->
+              rest_text =
+                rest
+                |> Enum.map_join("\n", fn line ->
+                  if String.trim(line) == "", do: "", else: "#{indent}  #{line}"
+                end)
+                |> String.trim_trailing()
+
+              item_text = "#{indent}#{marker}#{first}"
+              if(rest_text == "", do: item_text, else: item_text <> "\n" <> rest_text)
+          end
+      end)
+      |> Enum.join("\n")
+
+    "\n\n#{rendered}\n\n"
+  end
+
+  defp rewrite_href(nil, _ctx), do: nil
+
+  defp rewrite_href("#" <> _ = href, _ctx), do: href
+
+  defp rewrite_href(href, ctx) do
+    uri = URI.parse(href)
+    page_id = SyncConfluence.Util.page_id_from_uri(uri)
+
+    cond do
+      page_id && Map.has_key?(ctx.pages_by_id, page_id) ->
+        target = Map.fetch!(ctx.pages_by_id, page_id)
+        relative = Util.relative_link(ctx.page.relative_path, target.relative_path)
+        anchor = if uri.fragment, do: "##{uri.fragment}", else: ""
+        relative <> anchor
+
+      String.starts_with?(href, "/") ->
+        href
+
+      true ->
+        href
+    end
+  end
+
+  defp attr(attrs, name) do
+    Enum.find_value(attrs, fn
+      {^name, value} -> value
+      _ -> nil
+    end)
+  end
+
+  defp postprocess_markdown(markdown) do
+    markdown
+    |> String.replace(~r/[ \t]+\n/u, "\n")
+    |> String.replace(~r/\n{3,}/u, "\n\n")
+    |> String.trim()
+    |> case do
+      "" -> ""
+      value -> value <> "\n"
+    end
+  end
+end
+
+defmodule SyncConfluence.Writer do
+  alias SyncConfluence.Util
+
+  def write_page(page, markdown_body, summary) do
+    metadata = %{
+      "confluence_page_id" => page.id,
+      "title" => page.title,
+      "space_id" => page.space_id,
+      "parent_page_id" => if(page.parent_type == "page", do: page.parent_id, else: nil),
+      "source_url" => page.source_url,
+      "version" => page.version,
+      "status" => "active"
+    }
+
+    content =
+      metadata
+      |> Util.yaml_frontmatter()
+      |> Kernel.<>(Util.normalize_markdown(markdown_body))
+
+    Util.ensure_directory(page.absolute_path)
+    File.write!(page.absolute_path, content)
+
+    increment_summary(summary, :written)
+  end
+
+  defp increment_summary(summary, key) do
+    Map.update(summary, key, 1, &(&1 + 1))
+  end
+end
+
+defmodule SyncConfluence do
+  alias SyncConfluence.Client
+  alias SyncConfluence.Logger
+  alias SyncConfluence.Markdown
+  alias SyncConfluence.Tree
+  alias SyncConfluence.Util
+  alias SyncConfluence.Writer
+
+  def main(config, argv) do
+    {opts, _args, invalid} =
+      OptionParser.parse(argv,
+        strict: [
+          out: :string,
+          parent: :keep,
+          with_children: :boolean,
+          without_children: :boolean,
+          verbose: :boolean,
+          help: :boolean
+        ]
+      )
+
+    if invalid != [] do
+      invalid_flags =
+        invalid
+        |> Enum.map(fn {flag, value} -> "#{flag}=#{inspect(value)}" end)
+        |> Enum.join(", ")
+
+      raise "Invalid option(s): #{invalid_flags}"
+    end
+
+    if opts[:help] do
+      usage(config)
+    else
+      run_sync(config, opts)
+    end
+  end
+
+  defp run_sync(config, opts) do
+    ensure_config!(config)
+
+    verbose = Keyword.get(opts, :verbose, false)
+    output_dir = Path.expand(Keyword.get(opts, :out, config.local_sync_dir), File.cwd!())
+    include_children = child_page_setting(opts, config)
+    parent_ids = parse_parent_ids!(Keyword.get_values(opts, :parent))
+
+    client = Client.new(config)
+    child_page_label = if include_children, do: "enabled", else: "disabled"
+
+    Logger.log("Preparing sync for #{length(parent_ids)} root page(s)...", true)
+    Logger.log("Child pages: #{child_page_label}", true)
+    Logger.log("Local output directory: #{output_dir}", true)
+
+    nodes = fetch_nodes!(client, parent_ids, include_children, verbose)
+    enriched_nodes = Tree.enrich_paths(nodes, output_dir)
+    page_nodes = Enum.filter(enriched_nodes, fn node -> node.type == "page" end)
+    pages_by_root_and_id = build_page_lookup(page_nodes)
+    summary = %{written: 0}
+
+    summary =
+      sync_pages(page_nodes, client, pages_by_root_and_id, verbose, summary)
+
+    IO.puts("")
+    IO.puts("Sync complete.")
+    IO.puts("Output directory: #{output_dir}")
+    IO.puts("Written: #{summary.written}")
+  end
+
+  defp parse_parent_ids!([]) do
+    raise "Please provide at least one --parent value."
+  end
+
+  defp parse_parent_ids!(parent_values) do
+    Enum.map(parent_values, fn value ->
+      case Util.parse_page_id(value) do
+        {:ok, id} -> id
+        {:error, reason} -> raise reason
+      end
+    end)
+  end
+
+  defp fetch_nodes!(client, parent_ids, include_children, verbose) do
+    Enum.reduce(parent_ids, [], fn root_id, acc ->
+      Logger.log("Fetching page tree for root #{root_id}...", true)
+
+      case Client.fetch_tree(client, root_id, include_children, verbose) do
+        {:ok, fetched_nodes} ->
+          acc ++ fetched_nodes
+
+        {:error, reason} ->
+          raise reason
+      end
+    end)
+  end
+
+  defp build_page_lookup(page_nodes) do
+    Enum.reduce(page_nodes, %{}, fn page, acc ->
+      Map.put(acc, {page.root_parent_id, page.id}, page)
+    end)
+  end
+
+  defp sync_pages(page_nodes, client, pages_by_root_and_id, verbose, summary) do
+    Enum.reduce(page_nodes, summary, fn page, summary_acc ->
+      Logger.log("Converting page #{page.id} (#{page.title}) to Markdown...", verbose)
+
+      html =
+        case Client.convert_storage_to_export_view(client, page.id, page.storage_value) do
+          {:ok, export_view_html} ->
+            export_view_html
+
+          {:error, reason} ->
+            Logger.log("Falling back to storage HTML for page #{page.id}: #{reason}", true)
+            page.storage_value
+        end
+
+      local_pages_by_id = pages_for_root(pages_by_root_and_id, page.root_parent_id)
+      markdown_body = Markdown.from_html(html, page, local_pages_by_id)
+      Writer.write_page(page, markdown_body, summary_acc)
+    end)
+  end
+
+  defp pages_for_root(pages_by_root_and_id, root_parent_id) do
+    Enum.reduce(pages_by_root_and_id, %{}, fn
+      {{^root_parent_id, page_id}, page}, acc -> Map.put(acc, page_id, page)
+      {_other_key, _page}, acc -> acc
+    end)
+  end
+
+  defp ensure_config!(config) do
+    cond do
+      config.confluence_base_url in ["", "https://your-site.atlassian.net"] ->
+        raise "Please set confluence_base_url at the top of sync_confluence.exs."
+
+      config.confluence_email in ["", "you@example.com"] ->
+        raise "Please set confluence_email at the top of sync_confluence.exs."
+
+      config.confluence_api_token in ["", "replace-me"] ->
+        raise "Please set confluence_api_token at the top of sync_confluence.exs."
+
+      true ->
+        :ok
+    end
+  end
+
+  defp child_page_setting(opts, config) do
+    cond do
+      opts[:with_children] -> true
+      opts[:without_children] -> false
+      true -> config.sync_child_pages
+    end
+  end
+
+  defp usage(config) do
+    IO.puts("""
+    Usage:
+      elixir sync_confluence.exs --parent <url-or-page-id> [--parent <url-or-page-id> ...] [--out <dir>] [--with-children|--without-children] [--verbose]
+
+    Defaults:
+      local_sync_dir   #{config.local_sync_dir}
+      child_pages      #{config.sync_child_pages}
+
+    Notes:
+      - Edit the Confluence credentials at the top of this script before running it.
+      - Edit local_sync_dir at the top of the script to choose the local sync folder.
+      - local_sync_dir is resolved relative to the directory where you run the script.
+      - Page links inside the synced subtree are rewritten to relative Markdown paths.
+      - Existing files at the same target paths are overwritten on every run.
+      - Old files that no longer match a current Confluence page are not tracked or cleaned up automatically.
+    """)
+  end
+end
+
+SyncConfluence.main(config, System.argv())

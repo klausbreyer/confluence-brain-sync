@@ -33,8 +33,9 @@ config = %{
   confluence_base_url: fetch_config.(:confluence_base_url, "https://your-site.atlassian.net") |> to_string() |> String.trim_trailing("/"),
   confluence_email: fetch_config.(:confluence_email, "you@example.com") |> to_string() |> String.trim(),
   confluence_api_token: fetch_config.(:confluence_api_token, "replace-me") |> to_string() |> String.trim(),
-  local_sync_dir: fetch_config.(:local_sync_dir, "./export") |> to_string(),
-  sync_child_pages: fetch_config.(:sync_child_pages, true)
+  local_sync_dir: fetch_config.(:local_sync_dir, "./confluence-context") |> to_string(),
+  sync_child_pages: fetch_config.(:sync_child_pages, true),
+  sync_targets: fetch_config.(:sync_targets, [])
 }
 
 defmodule SyncConfluence.Util do
@@ -50,6 +51,22 @@ defmodule SyncConfluence.Util do
     |> case do
       "" -> "untitled"
       slug -> slug
+    end
+  end
+
+  def safe_file_stem(nil), do: "Untitled"
+
+  def safe_file_stem(value) do
+    value
+    |> to_string()
+    |> String.trim()
+    |> String.replace(~r{[/:\\]+}u, " - ")
+    |> String.replace(~r/[?*"<>|]/u, "")
+    |> String.replace(~r/\s+/u, " ")
+    |> String.trim(". ")
+    |> case do
+      "" -> "Untitled"
+      stem -> stem
     end
   end
 
@@ -83,6 +100,9 @@ defmodule SyncConfluence.Util do
     cond do
       page_id = query_params["pageId"] ->
         page_id
+
+      homepage_id = query_params["homepageId"] ->
+        homepage_id
 
       match = Regex.run(~r{/pages/(\d+)(?:/|$)}, path || "") ->
         Enum.at(match, 1)
@@ -235,10 +255,91 @@ defmodule SyncConfluence.Client do
     end
   end
 
+  def fetch_page_target_tree(client, target, verbose) do
+    with {:ok, nodes} <- fetch_tree(client, target.page_id, target.include_children, verbose) do
+      synthetic_root = target_root_node(target)
+
+      adjusted_nodes =
+        nodes
+        |> Enum.map(fn node ->
+          normalized_parent_id =
+            if node.id == target.page_id do
+              target.id
+            else
+              node.parent_id
+            end
+
+          node
+          |> Map.put(:root_parent_id, target.id)
+          |> Map.put(:parent_id, normalized_parent_id)
+        end)
+
+      {:ok, [synthetic_root | adjusted_nodes]}
+    end
+  end
+
+  def fetch_space_target_tree(client, target, verbose) do
+    with {:ok, homepage} <- fetch_page(client, target.page_id),
+         {:ok, space_pages} <- fetch_space_pages(client, homepage.space_id, verbose) do
+      page_ids =
+        space_pages
+        |> Enum.map(& &1["id"])
+        |> Kernel.++([homepage.id])
+        |> Enum.uniq()
+
+      Logger.log("Fetching #{length(page_ids)} page bodies for space #{homepage.space_id}...", verbose)
+
+      pages =
+        Enum.reduce_while(page_ids, %{}, fn page_id, acc ->
+          case fetch_page(client, page_id) do
+            {:ok, page} -> {:cont, Map.put(acc, page_id, page)}
+            {:error, reason} -> {:halt, {:error, reason}}
+          end
+        end)
+
+      case pages do
+        {:error, reason} ->
+          {:error, reason}
+
+        page_map ->
+          page_ids_in_space = Map.keys(page_map) |> MapSet.new()
+
+          synthetic_root = target_root_node(target)
+
+          adjusted_nodes =
+            page_map
+            |> Map.values()
+            |> Enum.map(fn page ->
+              normalized_parent_id =
+                if page.parent_type == "page" and page.parent_id && MapSet.member?(page_ids_in_space, page.parent_id) do
+                  page.parent_id
+                else
+                  target.id
+                end
+
+              page
+              |> Map.put(:root_parent_id, target.id)
+              |> Map.put(:parent_id, normalized_parent_id)
+            end)
+
+          {:ok, [synthetic_root | adjusted_nodes]}
+      end
+    end
+  end
+
   def fetch_descendants(client, page_id, verbose) do
     paginate_json(
       client,
       "/wiki/api/v2/pages/#{page_id}/descendants",
+      [limit: 100],
+      verbose
+    )
+  end
+
+  def fetch_space_pages(client, space_id, verbose) do
+    paginate_json(
+      client,
+      "/wiki/api/v2/spaces/#{space_id}/pages",
       [limit: 100],
       verbose
     )
@@ -422,6 +523,17 @@ defmodule SyncConfluence.Client do
       root_parent_id: root_parent_id
     }
   end
+
+  defp target_root_node(target) do
+    %{
+      id: target.id,
+      type: "target",
+      title: target.output_dir,
+      parent_id: nil,
+      root_parent_id: target.id,
+      output_dir: target.output_dir
+    }
+  end
 end
 
 defmodule SyncConfluence.Tree do
@@ -429,99 +541,98 @@ defmodule SyncConfluence.Tree do
 
   def enrich_paths(nodes, output_dir) do
     roots = Enum.filter(nodes, &(&1.id == &1.root_parent_id))
-    root_slugs = assign_root_slugs(roots)
+    page_nodes = Enum.filter(nodes, &(&1.type == "page"))
 
-    nodes_by_key =
-      nodes
-      |> Enum.map(fn node -> {{node.root_parent_id, node.id}, node} end)
+    page_counts_by_root =
+      page_nodes
+      |> Enum.frequencies_by(& &1.root_parent_id)
+
+    configured_output_dirs =
+      roots
+      |> Enum.map(fn root -> {root.id, Map.get(root, :output_dir)} end)
+      |> Enum.reject(fn {_id, dir} -> is_nil(dir) or dir == "" end)
+
+    configured_output_dir_counts =
+      configured_output_dirs
+      |> Enum.map(fn {_id, dir} -> dir end)
+      |> Enum.frequencies()
+
+    root_dirs =
+      roots
+      |> Enum.map(fn root ->
+        page_count = Map.get(page_counts_by_root, root.id, 0)
+        configured_output_dir = Map.get(root, :output_dir)
+        configured_dir_shared? = configured_output_dir && Map.get(configured_output_dir_counts, configured_output_dir, 0) > 1
+
+        relative_dir =
+          cond do
+            page_count > 1 and configured_output_dir not in [nil, ""] ->
+              configured_output_dir
+
+            page_count > 1 ->
+              Util.slugify(root.title)
+
+            configured_dir_shared? ->
+              configured_output_dir
+
+            true ->
+              ""
+          end
+
+        {root.id, relative_dir}
+      end)
       |> Map.new()
 
-    sibling_slug_map =
-      nodes
-      |> Enum.group_by(fn node ->
-        {node.root_parent_id, sibling_parent_key(node)}
-      end)
-      |> Enum.flat_map(fn {{root_parent_id, parent_key}, siblings} ->
-        assign_sibling_slugs(root_parent_id, parent_key, siblings)
+    file_names =
+      page_nodes
+      |> Enum.group_by(& &1.root_parent_id)
+      |> Enum.flat_map(fn {root_parent_id, pages} ->
+        assign_file_names(root_parent_id, pages)
       end)
       |> Map.new()
 
     nodes
     |> Enum.map(fn node ->
-      dir_parts = build_dir_parts(node, nodes_by_key, root_slugs, sibling_slug_map)
-      relative_dir = Path.join(dir_parts)
-      relative_path = Path.join(relative_dir, "index.md")
+      relative_dir = Map.fetch!(root_dirs, node.root_parent_id)
+
+      relative_path =
+        if node.type == "page" do
+          maybe_join(relative_dir, Map.fetch!(file_names, {node.root_parent_id, node.id}))
+        else
+          maybe_join(relative_dir, ".sync-root")
+        end
 
       node
-      |> Map.put(:slug, Map.fetch!(sibling_slug_map, {node.root_parent_id, node.id}))
       |> Map.put(:relative_dir, relative_dir)
       |> Map.put(:relative_path, relative_path)
       |> Map.put(:absolute_path, Path.join(output_dir, relative_path))
     end)
   end
 
-  def sibling_parent_key(node) do
-    if node.id == node.root_parent_id, do: :__root__, else: node.parent_id || :__root__
-  end
-
-  defp assign_root_slugs(roots) do
-    assign_slug_values(roots)
-    |> Enum.map(fn {id, slug} -> {{id, :__root__}, slug} end)
-    |> Map.new()
-  end
-
-  defp assign_sibling_slugs(root_parent_id, _parent_key, siblings) do
-    assign_slug_values(siblings)
-    |> Enum.map(fn {id, slug} -> {{root_parent_id, id}, slug} end)
-  end
-
-  defp assign_slug_values(nodes) do
-    base_slugs =
-      Enum.map(nodes, fn node ->
-        {node.id, Util.slugify(node.title)}
+  defp assign_file_names(root_parent_id, pages) do
+    base_names =
+      Enum.map(pages, fn page ->
+        {page.id, Util.safe_file_stem(page.title)}
       end)
 
     counts =
-      base_slugs
-      |> Enum.frequencies_by(fn {_id, slug} -> slug end)
+      base_names
+      |> Enum.frequencies_by(fn {_id, stem} -> stem end)
 
-    Enum.map(base_slugs, fn {id, base_slug} ->
-      slug =
-        if Map.get(counts, base_slug, 0) > 1 do
-          "#{base_slug}-#{id}"
+    Enum.map(base_names, fn {id, stem} ->
+      file_name =
+        if Map.get(counts, stem, 0) > 1 do
+          "#{stem} (#{id}).md"
         else
-          base_slug
+          "#{stem}.md"
         end
 
-      {id, slug}
+      {{root_parent_id, id}, file_name}
     end)
   end
 
-  defp build_dir_parts(node, nodes_by_key, root_slugs, sibling_slug_map) do
-    do_build_dir_parts(node, nodes_by_key, root_slugs, sibling_slug_map, MapSet.new())
-  end
-
-  defp do_build_dir_parts(node, _nodes_by_key, root_slugs, _sibling_slug_map, _visited)
-       when node.id == node.root_parent_id do
-    [Map.fetch!(root_slugs, {node.root_parent_id, :__root__})]
-  end
-
-  defp do_build_dir_parts(node, nodes_by_key, root_slugs, sibling_slug_map, visited) do
-    key = {node.root_parent_id, node.id}
-
-    if MapSet.member?(visited, key) do
-      [Map.fetch!(root_slugs, {node.root_parent_id, :__root__}), Map.fetch!(sibling_slug_map, key)]
-    else
-      parent =
-        Map.get(nodes_by_key, {node.root_parent_id, node.parent_id}) ||
-          Map.get(nodes_by_key, {node.root_parent_id, node.root_parent_id})
-
-      parent_parts =
-        do_build_dir_parts(parent, nodes_by_key, root_slugs, sibling_slug_map, MapSet.put(visited, key))
-
-      parent_parts ++ [Map.fetch!(sibling_slug_map, key)]
-    end
-  end
+  defp maybe_join("", file_name), do: file_name
+  defp maybe_join(relative_dir, file_name), do: Path.join(relative_dir, file_name)
 end
 
 defmodule SyncConfluence.Markdown do
@@ -838,25 +949,15 @@ defmodule SyncConfluence do
     ensure_config!(config)
 
     verbose = Keyword.get(opts, :verbose, false)
-    output_dir = Path.expand(Keyword.get(opts, :out, config.local_sync_dir), File.cwd!())
-    include_children = child_page_setting(opts, config)
-    parent_ids = parse_parent_ids!(Keyword.get_values(opts, :parent))
-
     client = Client.new(config)
-    child_page_label = if include_children, do: "enabled", else: "disabled"
+    cli_parents = Keyword.get_values(opts, :parent)
 
-    Logger.log("Preparing sync for #{length(parent_ids)} root page(s)...", true)
-    Logger.log("Child pages: #{child_page_label}", true)
-    Logger.log("Local output directory: #{output_dir}", true)
-
-    nodes = fetch_nodes!(client, parent_ids, include_children, verbose)
-    enriched_nodes = Tree.enrich_paths(nodes, output_dir)
-    page_nodes = Enum.filter(enriched_nodes, fn node -> node.type == "page" end)
-    pages_by_root_and_id = build_page_lookup(page_nodes)
-    summary = %{written: 0}
-
-    summary =
-      sync_pages(page_nodes, client, pages_by_root_and_id, verbose, summary)
+    {summary, output_dir} =
+      if cli_parents != [] do
+        run_cli_sync(client, config, opts, cli_parents, verbose)
+      else
+        run_configured_sync(client, config, verbose)
+      end
 
     IO.puts("")
     IO.puts("Sync complete.")
@@ -864,8 +965,73 @@ defmodule SyncConfluence do
     IO.puts("Written: #{summary.written}")
   end
 
+  defp run_cli_sync(client, config, opts, cli_parents, verbose) do
+    output_dir = Path.expand(Keyword.get(opts, :out, config.local_sync_dir), File.cwd!())
+    include_children = child_page_setting(opts, config)
+    parent_ids = parse_parent_ids!(cli_parents)
+    child_page_label = if include_children, do: "enabled", else: "disabled"
+
+    Logger.log("Preparing sync for #{length(parent_ids)} CLI root page(s)...", true)
+    Logger.log("Child pages: #{child_page_label}", true)
+    Logger.log("Local output directory: #{output_dir}", true)
+
+    reset_directory!(output_dir)
+    nodes = fetch_nodes!(client, parent_ids, include_children, verbose)
+    summary = sync_target_nodes(nodes, output_dir, client, verbose, %{written: 0})
+
+    {summary, output_dir}
+  end
+
+  defp run_configured_sync(client, config, verbose) do
+    output_dir = Path.expand(config.local_sync_dir, File.cwd!())
+    targets = normalize_config_targets!(config)
+
+    Logger.log("Preparing sync for #{length(targets)} configured target(s)...", true)
+    Logger.log("Local output directory: #{output_dir}", true)
+
+    reset_directory!(output_dir)
+
+    summary =
+      Enum.reduce(targets, %{written: 0}, fn target, summary_acc ->
+        target_kind = if target.type == :space, do: "space", else: "page"
+        child_note = if target.type == :page and target.include_children, do: "with child pages", else: "without child pages"
+
+        Logger.log(
+          "Target #{target.output_dir}: #{target.source} (#{target_kind}#{if target.type == :page, do: ", #{child_note}", else: ""})",
+          true
+        )
+
+        nodes =
+          case target.type do
+            :page ->
+              case Client.fetch_page_target_tree(client, target, verbose) do
+                {:ok, fetched_nodes} -> fetched_nodes
+                {:error, reason} -> raise reason
+              end
+
+            :space ->
+              case Client.fetch_space_target_tree(client, target, verbose) do
+                {:ok, fetched_nodes} -> fetched_nodes
+                {:error, reason} -> raise reason
+              end
+          end
+
+        sync_target_nodes(nodes, output_dir, client, verbose, summary_acc)
+      end)
+
+    {summary, output_dir}
+  end
+
+  defp sync_target_nodes(nodes, output_dir, client, verbose, summary) do
+    enriched_nodes = Tree.enrich_paths(nodes, output_dir)
+    page_nodes = Enum.filter(enriched_nodes, fn node -> node.type == "page" end)
+    pages_by_root_and_id = build_page_lookup(page_nodes)
+
+    sync_pages(page_nodes, client, pages_by_root_and_id, verbose, summary)
+  end
+
   defp parse_parent_ids!([]) do
-    raise "Please provide at least one --parent value."
+    raise "Please provide at least one --parent value or define sync_targets in the config file."
   end
 
   defp parse_parent_ids!(parent_values) do
@@ -875,6 +1041,60 @@ defmodule SyncConfluence do
         {:error, reason} -> raise reason
       end
     end)
+  end
+
+  defp normalize_config_targets!(config) do
+    if config.sync_targets == [] do
+      raise "Please define sync_targets in #{config.config_file_name} or pass --parent on the command line."
+    end
+
+    config.sync_targets
+    |> Enum.with_index(1)
+    |> Enum.map(fn {target, index} -> normalize_target!(target, index, config) end)
+  end
+
+  defp normalize_target!(target, index, config) when is_list(target) do
+    normalize_target!(Map.new(target), index, config)
+  end
+
+  defp normalize_target!(%{} = target, index, config) do
+    type =
+      target
+      |> target_value(:type, "page")
+      |> to_string()
+      |> String.downcase()
+      |> case do
+        "page" -> :page
+        "space" -> :space
+        other -> raise "Unsupported sync target type #{inspect(other)} in #{config.config_file_name}."
+      end
+
+    source =
+      target_value(target, :source, nil) ||
+        raise "Each sync target in #{config.config_file_name} needs a source."
+
+    output_dir =
+      target_value(target, :output_dir, nil) ||
+        raise "Each sync target in #{config.config_file_name} needs an output_dir."
+
+    include_children =
+      target_value(target, :include_children, config.sync_child_pages)
+      |> normalize_boolean!("include_children", config)
+
+    page_id =
+      case Util.parse_page_id(source) do
+        {:ok, id} -> id
+        {:error, reason} -> raise reason
+      end
+
+    %{
+      id: "target:#{index}:#{output_dir}",
+      type: type,
+      source: source,
+      page_id: page_id,
+      output_dir: output_dir,
+      include_children: include_children
+    }
   end
 
   defp fetch_nodes!(client, parent_ids, include_children, verbose) do
@@ -924,6 +1144,21 @@ defmodule SyncConfluence do
     end)
   end
 
+  defp target_value(target, key, default) do
+    Map.get(target, key) || Map.get(target, Atom.to_string(key)) || default
+  end
+
+  defp normalize_boolean!(value, _key_name, _config) when is_boolean(value), do: value
+
+  defp normalize_boolean!(value, key_name, config) do
+    raise "Expected #{key_name} to be a boolean in #{config.config_file_name}, got: #{inspect(value)}"
+  end
+
+  defp reset_directory!(path) do
+    File.rm_rf!(path)
+    File.mkdir_p!(path)
+  end
+
   defp ensure_config!(config) do
     cond do
       not config.config_file_exists? ->
@@ -971,11 +1206,13 @@ defmodule SyncConfluence do
     Notes:
       - Put credentials and defaults into #{config.config_file_name}, next to this script.
       - You can start from #{Path.basename(config.example_config_file_path)}.
+      - Define multiple configured sync targets via sync_targets in the config file.
+      - Each target supports type (:page or :space), source, output_dir, and include_children.
       - Edit local_sync_dir in the config file to choose the local sync folder.
       - local_sync_dir is resolved relative to the directory where you run the script.
+      - Each target writes flat Markdown files directly into its target folder, no index.md structure.
       - Page links inside the synced subtree are rewritten to relative Markdown paths.
-      - Existing files at the same target paths are overwritten on every run.
-      - Old files that no longer match a current Confluence page are not tracked or cleaned up automatically.
+      - The whole output directory is cleared before each sync run so stale files do not remain behind.
     """)
   end
 end

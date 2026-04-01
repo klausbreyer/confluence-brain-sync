@@ -33,7 +33,7 @@ config = %{
   confluence_base_url: fetch_config.(:confluence_base_url, "https://your-site.atlassian.net") |> to_string() |> String.trim_trailing("/"),
   confluence_email: fetch_config.(:confluence_email, "you@example.com") |> to_string() |> String.trim(),
   confluence_api_token: fetch_config.(:confluence_api_token, "replace-me") |> to_string() |> String.trim(),
-  local_sync_dir: fetch_config.(:local_sync_dir, "./confluence-context") |> to_string(),
+  local_sync_dir: fetch_config.(:local_sync_dir, "./confluence-sync") |> to_string(),
   sync_child_pages: fetch_config.(:sync_child_pages, true),
   sync_targets: fetch_config.(:sync_targets, [])
 }

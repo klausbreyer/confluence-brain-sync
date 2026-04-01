@@ -9,7 +9,7 @@
   confluence_api_token: "replace-me",
 
   # Relative to the directory where you run: `elixir sync_confluence.exs`
-  local_sync_dir: "./confluence-context",
+  local_sync_dir: "./confluence-sync",
 
   # true  -> sync parent pages and all child pages
   # false -> sync only the explicitly provided parent pages

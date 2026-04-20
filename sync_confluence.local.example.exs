@@ -11,7 +11,7 @@
   # Relative to the directory where you run: `elixir sync_confluence.exs`
   local_sync_dir: "./confluence-sync",
 
-  # true  -> sync parent pages and all child pages
+  # true  -> sync parent pages plus nested child pages and folders recursively
   # false -> sync only the explicitly provided parent pages
   sync_child_pages: true,
 

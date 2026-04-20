@@ -273,12 +273,7 @@ defmodule SyncConfluence.Client do
   end
 
   def fetch_descendants(client, page_id, verbose) do
-    paginate_json(
-      client,
-      "/wiki/api/v2/pages/#{page_id}/descendants",
-      [limit: 100],
-      verbose
-    )
+    fetch_supported_children_recursive(client, "page", page_id, 1, verbose)
   end
 
   def fetch_page(client, page_id) do
@@ -385,6 +380,68 @@ defmodule SyncConfluence.Client do
   defp maybe_fetch_descendants(_client, _page_id, false, _verbose), do: {:ok, []}
   defp maybe_fetch_descendants(client, page_id, true, verbose), do: fetch_descendants(client, page_id, verbose)
 
+  defp fetch_direct_children(client, parent_type, parent_id, verbose) do
+    path =
+      case parent_type do
+        "page" -> "/wiki/api/v2/pages/#{parent_id}/direct-children"
+        "folder" -> "/wiki/api/v2/folders/#{parent_id}/direct-children"
+        "database" -> "/wiki/api/v2/databases/#{parent_id}/direct-children"
+        "embed" -> "/wiki/api/v2/embeds/#{parent_id}/direct-children"
+        "whiteboard" -> "/wiki/api/v2/whiteboards/#{parent_id}/direct-children"
+      end
+
+    case paginate_json(
+           client,
+           path,
+           [limit: 100],
+           verbose
+         ) do
+      {:error, reason} when is_binary(reason) ->
+        if is_missing_children_error?(reason) do
+          Logger.log(
+            "Skipping child traversal for #{parent_type} #{parent_id}: #{reason}",
+            true
+          )
+
+          {:ok, []}
+        else
+          {:error, reason}
+        end
+
+      result ->
+        result
+    end
+  end
+
+  defp fetch_supported_children_recursive(client, parent_type, parent_id, depth, verbose) do
+    with {:ok, children} <- fetch_direct_children(client, parent_type, parent_id, verbose) do
+      children
+      |> Enum.reduce_while({:ok, []}, fn child, {:ok, acc} ->
+        child_type = child["type"] || infer_child_type(parent_type)
+
+        cond do
+          not supported_tree_type?(child_type) ->
+            {:cont, {:ok, acc}}
+
+          true ->
+            node = normalize_child_node(child, child_type, parent_id, depth)
+
+            case fetch_supported_children_recursive(client, child_type, child["id"], depth + 1, verbose) do
+              {:ok, descendants} ->
+                {:cont, {:ok, [[node | descendants] | acc]}}
+
+              {:error, reason} ->
+                {:halt, {:error, reason}}
+            end
+        end
+      end)
+      |> case do
+        {:ok, descendants} -> {:ok, descendants |> Enum.reverse() |> List.flatten()}
+        error -> error
+      end
+    end
+  end
+
   defp do_paginate_json(client, url, params, verbose, acc) do
     case request_json(client, :get, url, params: params) do
       {:ok, %{"results" => results} = body, _response} ->
@@ -483,6 +540,28 @@ defmodule SyncConfluence.Client do
     }
   end
 
+  defp normalize_child_node(node, child_type, parent_id, depth) do
+    %{
+      "id" => node["id"],
+      "type" => child_type,
+      "title" => node["title"] || "#{String.capitalize(child_type)} #{node["id"]}",
+      "parentId" => parent_id,
+      "depth" => depth,
+      "childPosition" => node["childPosition"] || 0
+    }
+  end
+
+  defp supported_tree_type?(type) do
+    type in ["page", "folder", "database", "embed", "whiteboard"]
+  end
+
+  defp infer_child_type("page"), do: "page"
+  defp infer_child_type(type), do: type
+
+  defp is_missing_children_error?(reason) do
+    String.contains?(reason, "HTTP 404")
+  end
+
   defp target_root_node(target) do
     %{
       id: target.id,
@@ -500,10 +579,13 @@ defmodule SyncConfluence.Tree do
 
   def enrich_paths(nodes, output_dir) do
     roots = Enum.filter(nodes, &(&1.id == &1.root_parent_id))
-    page_nodes = Enum.filter(nodes, &(&1.type == "page"))
+    nodes_by_root =
+      nodes
+      |> Enum.group_by(& &1.root_parent_id)
 
     page_counts_by_root =
-      page_nodes
+      nodes
+      |> Enum.filter(&(&1.type == "page"))
       |> Enum.frequencies_by(& &1.root_parent_id)
 
     root_dirs =
@@ -528,52 +610,129 @@ defmodule SyncConfluence.Tree do
       end)
       |> Map.new()
 
-    file_names =
-      page_nodes
-      |> Enum.group_by(& &1.root_parent_id)
-      |> Enum.flat_map(fn {root_parent_id, pages} ->
-        assign_file_names(root_parent_id, pages)
+    nodes_with_dirs =
+      roots
+      |> Enum.flat_map(fn root ->
+        root_dir = Map.fetch!(root_dirs, root.id)
+        root_nodes = Map.fetch!(nodes_by_root, root.id)
+        assign_paths_for_root(root, root_nodes, root_dir)
+      end)
+
+    page_paths =
+      nodes_with_dirs
+      |> Enum.filter(&(&1.type == "page"))
+      |> Enum.group_by(& &1.relative_dir)
+      |> Enum.flat_map(fn {relative_dir, pages} ->
+        file_names = assign_page_file_names(pages)
+
+        Enum.map(pages, fn page ->
+          {page.id, maybe_join(relative_dir, Map.fetch!(file_names, page.id))}
+        end)
       end)
       |> Map.new()
 
-    nodes
+    nodes_with_dirs
     |> Enum.map(fn node ->
-      relative_dir = Map.fetch!(root_dirs, node.root_parent_id)
-
       relative_path =
-        if node.type == "page" do
-          maybe_join(relative_dir, Map.fetch!(file_names, {node.root_parent_id, node.id}))
-        else
-          maybe_join(relative_dir, ".sync-root")
+        case node.type do
+          "page" -> Map.fetch!(page_paths, node.id)
+          _ -> node.relative_dir
         end
 
       node
-      |> Map.put(:relative_dir, relative_dir)
       |> Map.put(:relative_path, relative_path)
       |> Map.put(:absolute_path, Path.join(output_dir, relative_path))
     end)
   end
 
-  defp assign_file_names(root_parent_id, pages) do
-    base_names =
-      Enum.map(pages, fn page ->
-        {page.id, Util.safe_file_stem(page.title)}
-      end)
+  defp assign_paths_for_root(root, root_nodes, root_dir) do
+    children_by_parent =
+      root_nodes
+      |> Enum.reject(&(&1.id == root.id))
+      |> Enum.group_by(& &1.parent_id)
 
+    root_with_paths =
+      root
+      |> Map.put(:relative_dir, root_dir)
+      |> Map.put(:relative_path, root_dir)
+
+    [root_with_paths | assign_child_paths(root.id, children_by_parent, root_dir)]
+  end
+
+  defp assign_child_paths(parent_id, children_by_parent, current_dir) do
+    children =
+      children_by_parent
+      |> Map.get(parent_id, [])
+      |> Enum.sort_by(&{&1.child_position || 0, &1.title || "", &1.id})
+
+    folder_names =
+      children
+      |> Enum.filter(&folder_type?/1)
+      |> assign_directory_names()
+
+    Enum.flat_map(children, fn child ->
+      cond do
+        child.type == "page" ->
+          page =
+            child
+            |> Map.put(:relative_dir, current_dir)
+            |> Map.put(:relative_path, current_dir)
+
+          [page | assign_child_paths(child.id, children_by_parent, current_dir)]
+
+        folder_type?(child) ->
+          folder_dir = maybe_join(current_dir, Map.fetch!(folder_names, child.id))
+
+          folder =
+            child
+            |> Map.put(:relative_dir, folder_dir)
+            |> Map.put(:relative_path, folder_dir)
+
+          [folder | assign_child_paths(child.id, children_by_parent, folder_dir)]
+
+        true ->
+          assign_child_paths(child.id, children_by_parent, current_dir)
+      end
+    end)
+  end
+
+  defp assign_page_file_names(pages) do
+    pages
+    |> Enum.map(fn page ->
+      {page.id, Util.safe_file_stem(page.title)}
+    end)
+    |> assign_unique_names(fn stem, _id -> "#{stem}.md" end, fn stem, id -> "#{stem} (#{id}).md" end)
+  end
+
+  defp assign_directory_names(nodes) do
+    nodes
+    |> Enum.map(fn node ->
+      {node.id, Util.safe_file_stem(node.title)}
+    end)
+    |> assign_unique_names(fn stem, _id -> stem end, fn stem, id -> "#{stem} (#{id})" end)
+  end
+
+  defp assign_unique_names(base_names, unique_name_fun, duplicate_name_fun) do
     counts =
       base_names
       |> Enum.frequencies_by(fn {_id, stem} -> stem end)
 
-    Enum.map(base_names, fn {id, stem} ->
-      file_name =
+    base_names
+    |> Enum.map(fn {id, stem} ->
+      name =
         if Map.get(counts, stem, 0) > 1 do
-          "#{stem} (#{id}).md"
+          duplicate_name_fun.(stem, id)
         else
-          "#{stem}.md"
+          unique_name_fun.(stem, id)
         end
 
-      {{root_parent_id, id}, file_name}
+      {id, name}
     end)
+    |> Map.new()
+  end
+
+  defp folder_type?(node) do
+    node.type in ["folder", "database", "embed", "whiteboard"]
   end
 
   defp maybe_join("", file_name), do: file_name
@@ -826,6 +985,11 @@ end
 defmodule SyncConfluence.Writer do
   alias SyncConfluence.Util
 
+  def ensure_container(node, summary) do
+    File.mkdir_p!(node.absolute_path)
+    summary
+  end
+
   def write_page(page, markdown_body, summary) do
     metadata = %{
       "confluence_page_id" => page.id,
@@ -959,8 +1123,10 @@ defmodule SyncConfluence do
 
   defp sync_target_nodes(nodes, output_dir, client, verbose, summary) do
     enriched_nodes = Tree.enrich_paths(nodes, output_dir)
+    container_nodes = Enum.filter(enriched_nodes, fn node -> node.type != "page" end)
     page_nodes = Enum.filter(enriched_nodes, fn node -> node.type == "page" end)
     pages_by_root_and_id = build_page_lookup(page_nodes)
+    summary = Enum.reduce(container_nodes, summary, &Writer.ensure_container/2)
 
     sync_pages(page_nodes, client, pages_by_root_and_id, verbose, summary)
   end
@@ -1152,9 +1318,11 @@ defmodule SyncConfluence do
       - You can start from #{Path.basename(config.example_config_file_path)}.
       - Define multiple configured sync targets via sync_targets in the config file.
       - Each target supports source, output_dir, and include_children.
+      - include_children walks nested subpages recursively, not just direct children.
       - Edit local_sync_dir in the config file to choose the local sync folder.
       - local_sync_dir is resolved relative to the directory where you run the script.
-      - Each target writes flat Markdown files directly into its target folder, no index.md structure.
+      - Confluence folders are mirrored as local directories; pages are written as Markdown files inside them.
+      - Page-to-page nesting stays flat within the current folder path, no index.md structure.
       - Page links inside the synced subtree are rewritten to relative Markdown paths.
       - The whole output directory is cleared before each sync run so stale files do not remain behind.
     """)

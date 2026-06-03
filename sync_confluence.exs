@@ -623,11 +623,20 @@ defmodule SyncConfluence.Tree do
       |> Enum.filter(&(&1.type == "page"))
       |> Enum.group_by(& &1.relative_dir)
       |> Enum.flat_map(fn {relative_dir, pages} ->
-        file_names = assign_page_file_names(pages)
+        {container_pages, leaf_pages} = Enum.split_with(pages, &page_container?/1)
+        leaf_file_names = assign_page_file_names(leaf_pages)
 
-        Enum.map(pages, fn page ->
-          {page.id, maybe_join(relative_dir, Map.fetch!(file_names, page.id))}
-        end)
+        container_page_paths =
+          Enum.map(container_pages, fn page ->
+            {page.id, maybe_join(page.relative_dir, "index.md")}
+          end)
+
+        leaf_page_paths =
+          Enum.map(leaf_pages, fn page ->
+            {page.id, maybe_join(relative_dir, Map.fetch!(leaf_file_names, page.id))}
+          end)
+
+        container_page_paths ++ leaf_page_paths
       end)
       |> Map.new()
 
@@ -651,47 +660,55 @@ defmodule SyncConfluence.Tree do
       |> Enum.reject(&(&1.id == root.id))
       |> Enum.group_by(& &1.parent_id)
 
+    root_has_children? = Map.has_key?(children_by_parent, root.id)
+
     root_with_paths =
       root
       |> Map.put(:relative_dir, root_dir)
+      |> Map.put(:is_container, root_has_children?)
       |> Map.put(:relative_path, root_dir)
 
-    [root_with_paths | assign_child_paths(root.id, children_by_parent, root_dir)]
+    [root_with_paths | assign_child_paths(root, children_by_parent, root_dir)]
   end
 
-  defp assign_child_paths(parent_id, children_by_parent, current_dir) do
+  defp assign_child_paths(parent, children_by_parent, current_dir) do
     children =
       children_by_parent
-      |> Map.get(parent_id, [])
+      |> Map.get(parent.id, [])
       |> Enum.sort_by(&{&1.child_position || 0, &1.title || "", &1.id})
 
-    folder_names =
+    directory_names =
       children
-      |> Enum.filter(&folder_type?/1)
+      |> Enum.filter(&(folder_type?(&1) or Map.has_key?(children_by_parent, &1.id)))
       |> assign_directory_names()
 
     Enum.flat_map(children, fn child ->
       cond do
         child.type == "page" ->
+          child_has_children? = Map.has_key?(children_by_parent, child.id)
+          page_dir = page_directory(current_dir, parent, child, child_has_children?, directory_names)
+
           page =
             child
-            |> Map.put(:relative_dir, current_dir)
-            |> Map.put(:relative_path, current_dir)
+            |> Map.put(:relative_dir, page_dir)
+            |> Map.put(:is_container, child_has_children?)
+            |> Map.put(:relative_path, page_dir)
 
-          [page | assign_child_paths(child.id, children_by_parent, current_dir)]
+          [page | assign_child_paths(page, children_by_parent, page_dir)]
 
         folder_type?(child) ->
-          folder_dir = maybe_join(current_dir, Map.fetch!(folder_names, child.id))
+          folder_dir = maybe_join(current_dir, Map.fetch!(directory_names, child.id))
 
           folder =
             child
             |> Map.put(:relative_dir, folder_dir)
+            |> Map.put(:is_container, true)
             |> Map.put(:relative_path, folder_dir)
 
-          [folder | assign_child_paths(child.id, children_by_parent, folder_dir)]
+          [folder | assign_child_paths(folder, children_by_parent, folder_dir)]
 
         true ->
-          assign_child_paths(child.id, children_by_parent, current_dir)
+          assign_child_paths(child, children_by_parent, current_dir)
       end
     end)
   end
@@ -733,6 +750,18 @@ defmodule SyncConfluence.Tree do
 
   defp folder_type?(node) do
     node.type in ["folder", "database", "embed", "whiteboard"]
+  end
+
+  defp page_container?(page) do
+    Map.get(page, :is_container, false)
+  end
+
+  defp page_directory(current_dir, _parent, _page, false, _directory_names), do: current_dir
+
+  defp page_directory(current_dir, %{type: "target"}, _page, true, _directory_names), do: current_dir
+
+  defp page_directory(current_dir, _parent, page, true, directory_names) do
+    maybe_join(current_dir, Map.fetch!(directory_names, page.id))
   end
 
   defp maybe_join("", file_name), do: file_name
@@ -1322,7 +1351,8 @@ defmodule SyncConfluence do
       - Edit local_sync_dir in the config file to choose the local sync folder.
       - local_sync_dir is resolved relative to the directory where you run the script.
       - Confluence folders are mirrored as local directories; pages are written as Markdown files inside them.
-      - Page-to-page nesting stays flat within the current folder path, no index.md structure.
+      - Pages with children are also mirrored as directories and their content is written to index.md.
+      - Leaf pages are written as Markdown files in the current folder.
       - Page links inside the synced subtree are rewritten to relative Markdown paths.
       - The whole output directory is cleared before each sync run so stale files do not remain behind.
     """)

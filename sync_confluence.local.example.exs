@@ -9,11 +9,15 @@
   confluence_api_token: "replace-me",
 
   # Relative to the directory where you run: `elixir sync_confluence.exs`
-  local_sync_dir: "./confluence-sync",
+  local_sync_dir: "./confluence-sync-parallel",
 
   # true  -> sync parent pages plus nested child pages and folders recursively
   # false -> sync only the explicitly provided parent pages
   sync_child_pages: true,
+
+  # Number of concurrent Confluence requests for page bodies and page conversion.
+  # If you see rate limiting, reduce this to 2 or 3.
+  sync_concurrency: 4,
 
   # Each target is synced into local_sync_dir/output_dir
   sync_targets: [

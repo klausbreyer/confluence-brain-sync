@@ -25,6 +25,25 @@ fetch_config = fn key, default ->
   Map.get(raw_config, key) || Map.get(raw_config, Atom.to_string(key)) || default
 end
 
+normalize_positive_integer = fn value, key_name ->
+  case value do
+    value when is_integer(value) and value > 0 ->
+      value
+
+    value when is_binary(value) ->
+      case Integer.parse(String.trim(value)) do
+        {integer, ""} when integer > 0 ->
+          integer
+
+        _ ->
+          raise "Expected #{key_name} to be a positive integer, got: #{inspect(value)}"
+      end
+
+    _ ->
+      raise "Expected #{key_name} to be a positive integer, got: #{inspect(value)}"
+  end
+end
+
 config = %{
   config_file_name: config_file_name,
   config_file_path: config_file_path,
@@ -33,8 +52,9 @@ config = %{
   confluence_base_url: fetch_config.(:confluence_base_url, "https://your-site.atlassian.net") |> to_string() |> String.trim_trailing("/"),
   confluence_email: fetch_config.(:confluence_email, "you@example.com") |> to_string() |> String.trim(),
   confluence_api_token: fetch_config.(:confluence_api_token, "replace-me") |> to_string() |> String.trim(),
-  local_sync_dir: fetch_config.(:local_sync_dir, "./confluence-sync") |> to_string(),
+  local_sync_dir: fetch_config.(:local_sync_dir, "./confluence-sync-parallel") |> to_string(),
   sync_child_pages: fetch_config.(:sync_child_pages, true),
+  sync_concurrency: fetch_config.(:sync_concurrency, 4) |> normalize_positive_integer.("sync_concurrency"),
   sync_targets: fetch_config.(:sync_targets, [])
 }
 
@@ -184,6 +204,7 @@ defmodule SyncConfluence.Client do
 
     %{
       base_url: config.confluence_base_url,
+      concurrency: config.sync_concurrency,
       req:
         Req.new(
           base_url: config.confluence_base_url,
@@ -305,19 +326,29 @@ defmodule SyncConfluence.Client do
   defp fetch_pages_map(client, page_ids, _verbose, opts) do
     allow_missing = Keyword.get(opts, :allow_missing, false)
 
-    Enum.reduce_while(page_ids, %{}, fn page_id, acc ->
-      case fetch_page(client, page_id) do
-        {:ok, page} ->
-          {:cont, Map.put(acc, page_id, page)}
+    page_ids
+    |> Task.async_stream(
+      fn page_id ->
+        {page_id, fetch_page(client, page_id)}
+      end,
+      max_concurrency: client.concurrency,
+      ordered: true,
+      timeout: :infinity
+    )
+    |> Enum.reduce_while(%{}, fn
+      {:ok, {page_id, {:ok, page}}}, acc ->
+        {:cont, Map.put(acc, page_id, page)}
 
-        {:error, reason} ->
-          if allow_missing and missing_page_error?(reason) do
-            Logger.log("Skipping missing or inaccessible child page #{page_id}: #{reason}", true)
-            {:cont, acc}
-          else
-            {:halt, {:error, reason}}
-          end
-      end
+      {:ok, {page_id, {:error, reason}}}, acc ->
+        if allow_missing and missing_page_error?(reason) do
+          Logger.log("Skipping missing or inaccessible child page #{page_id}: #{reason}", true)
+          {:cont, acc}
+        else
+          {:halt, {:error, reason}}
+        end
+
+      {:exit, reason}, _acc ->
+        {:halt, {:error, "Page body fetch task failed: #{inspect(reason)}"}}
     end)
   end
 
@@ -1086,6 +1117,7 @@ defmodule SyncConfluence do
   defp run_sync(config, opts) do
     ensure_config!(config)
 
+    started_at = System.monotonic_time()
     verbose = Keyword.get(opts, :verbose, false)
     client = Client.new(config)
     cli_parents = Keyword.get_values(opts, :parent)
@@ -1101,6 +1133,7 @@ defmodule SyncConfluence do
     IO.puts("Sync complete.")
     IO.puts("Output directory: #{output_dir}")
     IO.puts("Written: #{summary.written}")
+    IO.puts("Duration: #{format_duration(System.monotonic_time() - started_at)}")
   end
 
   defp run_cli_sync(client, config, opts, cli_parents, verbose) do
@@ -1111,6 +1144,7 @@ defmodule SyncConfluence do
 
     Logger.log("Preparing sync for #{length(parent_ids)} CLI root page(s)...", true)
     Logger.log("Child pages: #{child_page_label}", true)
+    Logger.log("Sync concurrency: #{config.sync_concurrency}", true)
     Logger.log("Local output directory: #{output_dir}", true)
 
     reset_directory!(output_dir)
@@ -1125,6 +1159,7 @@ defmodule SyncConfluence do
     targets = normalize_config_targets!(config)
 
     Logger.log("Preparing sync for #{length(targets)} configured target(s)...", true)
+    Logger.log("Sync concurrency: #{config.sync_concurrency}", true)
     Logger.log("Local output directory: #{output_dir}", true)
 
     reset_directory!(output_dir)
@@ -1238,22 +1273,37 @@ defmodule SyncConfluence do
   end
 
   defp sync_pages(page_nodes, client, pages_by_root_and_id, verbose, summary) do
-    Enum.reduce(page_nodes, summary, fn page, summary_acc ->
-      Logger.log("Converting page #{page.id} (#{page.title}) to Markdown...", verbose)
+    page_nodes
+    |> Task.async_stream(
+      fn page ->
+        Logger.log("Converting page #{page.id} (#{page.title}) to Markdown...", verbose)
 
-      html =
-        case Client.convert_storage_to_export_view(client, page.id, page.storage_value) do
-          {:ok, export_view_html} ->
-            export_view_html
+        html =
+          case Client.convert_storage_to_export_view(client, page.id, page.storage_value) do
+            {:ok, export_view_html} ->
+              export_view_html
 
-          {:error, reason} ->
-            Logger.log("Falling back to storage HTML for page #{page.id}: #{reason}", true)
-            page.storage_value
-        end
+            {:error, reason} ->
+              Logger.log("Falling back to storage HTML for page #{page.id}: #{reason}", true)
+              page.storage_value
+          end
 
-      local_pages_by_id = pages_for_root(pages_by_root_and_id, page.root_parent_id)
-      markdown_body = Markdown.from_html(html, page, local_pages_by_id)
-      Writer.write_page(page, markdown_body, summary_acc)
+        local_pages_by_id = pages_for_root(pages_by_root_and_id, page.root_parent_id)
+        markdown_body = Markdown.from_html(html, page, local_pages_by_id)
+        Writer.write_page(page, markdown_body, %{written: 0})
+
+        :written
+      end,
+      max_concurrency: client.concurrency,
+      ordered: true,
+      timeout: :infinity
+    )
+    |> Enum.reduce(summary, fn
+      {:ok, :written}, summary_acc ->
+        Map.update(summary_acc, :written, 1, &(&1 + 1))
+
+      {:exit, reason}, _summary_acc ->
+        raise "Page sync task failed: #{inspect(reason)}"
     end)
   end
 
@@ -1330,6 +1380,24 @@ defmodule SyncConfluence do
     end
   end
 
+  defp format_duration(native_duration) do
+    milliseconds = System.convert_time_unit(native_duration, :native, :millisecond)
+
+    cond do
+      milliseconds < 1_000 ->
+        "#{milliseconds}ms"
+
+      milliseconds < 60_000 ->
+        seconds = milliseconds / 1_000
+        "#{Float.round(seconds, 2)}s"
+
+      true ->
+        minutes = div(milliseconds, 60_000)
+        seconds = rem(milliseconds, 60_000) / 1_000
+        "#{minutes}m #{Float.round(seconds, 2)}s"
+    end
+  end
+
   defp usage(config) do
     IO.puts("""
     Usage:
@@ -1341,6 +1409,7 @@ defmodule SyncConfluence do
     Defaults:
       local_sync_dir   #{config.local_sync_dir}
       child_pages      #{config.sync_child_pages}
+      concurrency      #{config.sync_concurrency}
 
     Notes:
       - Put credentials and defaults into #{config.config_file_name}, next to this script.

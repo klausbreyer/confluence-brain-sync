@@ -178,6 +178,8 @@ defmodule SyncConfluence.Client do
   alias SyncConfluence.Logger
   alias SyncConfluence.Util
 
+  @page_body_fetch_concurrency 16
+
   def new(config) do
     auth =
       Base.encode64("#{config.confluence_email}:#{config.confluence_api_token}")
@@ -305,19 +307,29 @@ defmodule SyncConfluence.Client do
   defp fetch_pages_map(client, page_ids, _verbose, opts) do
     allow_missing = Keyword.get(opts, :allow_missing, false)
 
-    Enum.reduce_while(page_ids, %{}, fn page_id, acc ->
-      case fetch_page(client, page_id) do
-        {:ok, page} ->
-          {:cont, Map.put(acc, page_id, page)}
+    page_ids
+    |> Task.async_stream(
+      fn page_id ->
+        {page_id, fetch_page(client, page_id)}
+      end,
+      max_concurrency: @page_body_fetch_concurrency,
+      ordered: true,
+      timeout: :infinity
+    )
+    |> Enum.reduce_while(%{}, fn
+      {:ok, {page_id, {:ok, page}}}, acc ->
+        {:cont, Map.put(acc, page_id, page)}
 
-        {:error, reason} ->
-          if allow_missing and missing_page_error?(reason) do
-            Logger.log("Skipping missing or inaccessible child page #{page_id}: #{reason}", true)
-            {:cont, acc}
-          else
-            {:halt, {:error, reason}}
-          end
-      end
+      {:ok, {page_id, {:error, reason}}}, acc ->
+        if allow_missing and missing_page_error?(reason) do
+          Logger.log("Skipping missing or inaccessible child page #{page_id}: #{reason}", true)
+          {:cont, acc}
+        else
+          {:halt, {:error, reason}}
+        end
+
+      {:exit, reason}, _acc ->
+        {:halt, {:error, "Page fetch task failed: #{inspect(reason)}"}}
     end)
   end
 
@@ -1054,6 +1066,10 @@ defmodule SyncConfluence do
   alias SyncConfluence.Util
   alias SyncConfluence.Writer
 
+  @target_concurrency 8
+  @root_tree_fetch_concurrency 8
+  @page_conversion_concurrency 16
+
   def main(config, argv) do
     {opts, _args, invalid} =
       OptionParser.parse(argv,
@@ -1086,6 +1102,7 @@ defmodule SyncConfluence do
   defp run_sync(config, opts) do
     ensure_config!(config)
 
+    started_at = System.monotonic_time(:millisecond)
     verbose = Keyword.get(opts, :verbose, false)
     client = Client.new(config)
     cli_parents = Keyword.get_values(opts, :parent)
@@ -1101,6 +1118,7 @@ defmodule SyncConfluence do
     IO.puts("Sync complete.")
     IO.puts("Output directory: #{output_dir}")
     IO.puts("Written: #{summary.written}")
+    IO.puts("Duration: #{format_duration(System.monotonic_time(:millisecond) - started_at)}")
   end
 
   defp run_cli_sync(client, config, opts, cli_parents, verbose) do
@@ -1110,6 +1128,7 @@ defmodule SyncConfluence do
     child_page_label = if include_children, do: "enabled", else: "disabled"
 
     Logger.log("Preparing sync for #{length(parent_ids)} CLI root page(s)...", true)
+    Logger.log("Sync concurrency: #{@root_tree_fetch_concurrency}", true)
     Logger.log("Child pages: #{child_page_label}", true)
     Logger.log("Local output directory: #{output_dir}", true)
 
@@ -1125,26 +1144,44 @@ defmodule SyncConfluence do
     targets = normalize_config_targets!(config)
 
     Logger.log("Preparing sync for #{length(targets)} configured target(s)...", true)
+    Logger.log("Sync concurrency: #{@target_concurrency}", true)
     Logger.log("Local output directory: #{output_dir}", true)
 
     reset_directory!(output_dir)
 
     summary =
-      Enum.reduce(targets, %{written: 0}, fn target, summary_acc ->
-        child_note = if target.include_children, do: "with child pages", else: "without child pages"
+      targets
+      |> Task.async_stream(
+        fn target ->
+          child_note =
+            if target.include_children, do: "with child pages", else: "without child pages"
 
-        Logger.log(
-          "Target #{target.output_dir}: #{target.source} (page, #{child_note})",
-          true
-        )
+          Logger.log(
+            "Target #{target.output_dir}: #{target.source} (page, #{child_note})",
+            true
+          )
 
-        nodes =
           case Client.fetch_page_target_tree(client, target, verbose) do
-            {:ok, fetched_nodes} -> fetched_nodes
-            {:error, reason} -> raise reason
-          end
+            {:ok, nodes} ->
+              {:ok, sync_target_nodes(nodes, output_dir, client, verbose, %{written: 0})}
 
-        sync_target_nodes(nodes, output_dir, client, verbose, summary_acc)
+            {:error, reason} ->
+              {:error, reason}
+          end
+        end,
+        max_concurrency: @target_concurrency,
+        ordered: true,
+        timeout: :infinity
+      )
+      |> Enum.reduce(%{written: 0}, fn
+        {:ok, {:ok, target_summary}}, summary_acc ->
+          merge_summary(summary_acc, target_summary)
+
+        {:ok, {:error, reason}}, _summary_acc ->
+          raise reason
+
+        {:exit, reason}, _summary_acc ->
+          raise "Target sync task failed: #{inspect(reason)}"
       end)
 
     {summary, output_dir}
@@ -1218,16 +1255,25 @@ defmodule SyncConfluence do
   end
 
   defp fetch_nodes!(client, parent_ids, include_children, verbose) do
-    Enum.reduce(parent_ids, [], fn root_id, acc ->
-      Logger.log("Fetching page tree for root #{root_id}...", true)
+    parent_ids
+    |> Task.async_stream(
+      fn root_id ->
+        Logger.log("Fetching page tree for root #{root_id}...", true)
+        Client.fetch_tree(client, root_id, include_children, verbose)
+      end,
+      max_concurrency: @root_tree_fetch_concurrency,
+      ordered: true,
+      timeout: :infinity
+    )
+    |> Enum.reduce([], fn
+      {:ok, {:ok, fetched_nodes}}, acc ->
+        acc ++ fetched_nodes
 
-      case Client.fetch_tree(client, root_id, include_children, verbose) do
-        {:ok, fetched_nodes} ->
-          acc ++ fetched_nodes
+      {:ok, {:error, reason}}, _acc ->
+        raise reason
 
-        {:error, reason} ->
-          raise reason
-      end
+      {:exit, reason}, _acc ->
+        raise "Page tree fetch task failed: #{inspect(reason)}"
     end)
   end
 
@@ -1238,30 +1284,63 @@ defmodule SyncConfluence do
   end
 
   defp sync_pages(page_nodes, client, pages_by_root_and_id, verbose, summary) do
-    Enum.reduce(page_nodes, summary, fn page, summary_acc ->
-      Logger.log("Converting page #{page.id} (#{page.title}) to Markdown...", verbose)
+    pages_by_root = pages_by_root_lookup(pages_by_root_and_id)
 
-      html =
-        case Client.convert_storage_to_export_view(client, page.id, page.storage_value) do
-          {:ok, export_view_html} ->
-            export_view_html
+    page_nodes
+    |> Task.async_stream(
+      fn page ->
+        Logger.log("Converting page #{page.id} (#{page.title}) to Markdown...", verbose)
 
-          {:error, reason} ->
-            Logger.log("Falling back to storage HTML for page #{page.id}: #{reason}", true)
-            page.storage_value
-        end
+        html =
+          case Client.convert_storage_to_export_view(client, page.id, page.storage_value) do
+            {:ok, export_view_html} ->
+              export_view_html
 
-      local_pages_by_id = pages_for_root(pages_by_root_and_id, page.root_parent_id)
-      markdown_body = Markdown.from_html(html, page, local_pages_by_id)
-      Writer.write_page(page, markdown_body, summary_acc)
+            {:error, reason} ->
+              Logger.log("Falling back to storage HTML for page #{page.id}: #{reason}", true)
+              page.storage_value
+          end
+
+        local_pages_by_id = Map.get(pages_by_root, page.root_parent_id, %{})
+        markdown_body = Markdown.from_html(html, page, local_pages_by_id)
+        Writer.write_page(page, markdown_body, %{written: 0})
+      end,
+      max_concurrency: @page_conversion_concurrency,
+      ordered: true,
+      timeout: :infinity
+    )
+    |> Enum.reduce(summary, fn
+      {:ok, page_summary}, summary_acc ->
+        merge_summary(summary_acc, page_summary)
+
+      {:exit, reason}, _summary_acc ->
+        raise "Page conversion task failed: #{inspect(reason)}"
     end)
   end
 
-  defp pages_for_root(pages_by_root_and_id, root_parent_id) do
-    Enum.reduce(pages_by_root_and_id, %{}, fn
-      {{^root_parent_id, page_id}, page}, acc -> Map.put(acc, page_id, page)
-      {_other_key, _page}, acc -> acc
+  defp pages_by_root_lookup(pages_by_root_and_id) do
+    Enum.reduce(pages_by_root_and_id, %{}, fn {{root_parent_id, page_id}, page}, acc ->
+      Map.update(acc, root_parent_id, %{page_id => page}, fn pages ->
+        Map.put(pages, page_id, page)
+      end)
     end)
+  end
+
+  defp merge_summary(summary, next_summary) do
+    written = Map.get(next_summary, :written, 0)
+    Map.update(summary, :written, written, &(&1 + written))
+  end
+
+  defp format_duration(milliseconds) do
+    total_seconds = div(milliseconds, 1_000)
+    minutes = div(total_seconds, 60)
+    seconds = rem(total_seconds, 60) + rem(milliseconds, 1_000) / 1_000
+
+    if minutes > 0 do
+      "#{minutes}m #{:erlang.float_to_binary(seconds, decimals: 2)}s"
+    else
+      "#{:erlang.float_to_binary(seconds, decimals: 2)}s"
+    end
   end
 
   defp target_value(target, key, default) do

@@ -1,61 +1,38 @@
 %{
-  # Example: "https://myosotis.atlassian.net"
   confluence_base_url: "https://myosotis.atlassian.net",
 
-  # Your Atlassian login email
+  # Your Atlassian login email and API token
   confluence_email: "you@example.com",
-
-  # Create this token in your Atlassian account security settings
   confluence_api_token: "replace-me",
 
-  # Relative to the directory where you run: `elixir sync_confluence.exs`
-  local_sync_dir: "./confluence-sync",
+  # Relative to the directory where you run the script. Cleared before each sync.
+  # Keep trial runs separate from an existing page-based export.
+  local_sync_dir: "./confluence-sync-spaces",
 
-  # true  -> sync parent pages plus nested child pages and folders recursively
-  # false -> sync only the explicitly provided parent pages
-  sync_child_pages: true,
-
-  # Each target is synced into local_sync_dir/output_dir
+  # Always sync every accessible current page, including all nested subpages.
+  # Each space becomes a top-level folder. Without output_dir, its key is used.
+  # Plain space keys (e.g. "PED") or overview URLs also work as list entries.
   sync_targets: [
     %{
-      source:
-        "https://myosotis.atlassian.net/wiki/spaces/Management/pages/4144889873/One+Page+Plan",
-      output_dir: "strategy",
-      include_children: true
+      source: "https://myosotis.atlassian.net/wiki/spaces/PED/overview",
+      output_dir: "PED"
+    },
+    %{
+      source: "https://myosotis.atlassian.net/wiki/spaces/FFP/overview",
+      output_dir: "FFP"
+    },
+    %{
+      source: "https://myosotis.atlassian.net/wiki/spaces/myoformfix/overview",
+      output_dir: "myoformfix"
     },
     %{
       source:
-        "https://myosotis.atlassian.net/wiki/spaces/Management/pages/3848568833/AK+Strategy",
-      output_dir: "strategy",
-      include_children: false
+        "https://myosotis.atlassian.net/wiki/spaces/~712020e2d192065fec4c0e90ea115757a438c4/overview?homepageId=3727524416",
+      output_dir: "Privat"
     },
     %{
-      source:
-        "https://myosotis.atlassian.net/wiki/spaces/FFP/pages/4087349249/Platform+Strategie+Buy+Build",
-      output_dir: "strategy",
-      include_children: true
-    },
-    %{
-      source:
-        "https://myosotis.atlassian.net/wiki/spaces/strategy/pages/3831857153/Company+Pivot+Strategy",
-      output_dir: "strategy",
-      include_children: false
-    },
-    %{
-      source:
-        "https://myosotis.atlassian.net/wiki/spaces/PTD/pages/4179394562/Product+Operating+Model",
-      output_dir: "product-operating-model",
-      include_children: true
-    },
-    %{
-      source: "https://myosotis.atlassian.net/wiki/spaces/PTD/pages/4428922884/PED+Handbook",
-      output_dir: "ped-handbook",
-      include_children: true
-    },
-    %{
-      source: "https://myosotis.atlassian.net/wiki/spaces/PTD/pages/4361453590/Accountabilities",
-      output_dir: "accountabilities",
-      include_children: true
+      source: "https://myosotis.atlassian.net/wiki/spaces/MYO/overview",
+      output_dir: "MYO"
     }
   ]
 }

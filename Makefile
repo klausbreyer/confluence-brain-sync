@@ -2,7 +2,10 @@ TARGET_DIR ?= $(HOME)/vault/v01/myo
 SCRIPT_NAME := sync_confluence.exs
 CONFIG_NAME := sync_confluence.local.exs
 
-.PHONY: deploy
+.PHONY: deploy test
+
+test:
+	elixir sync_confluence_test.exs
 
 deploy:
 	mkdir -p "$(TARGET_DIR)"

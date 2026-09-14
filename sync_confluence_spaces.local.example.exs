@@ -6,8 +6,7 @@
   confluence_api_token: "replace-me",
 
   # Relative to the directory where you run the script. Cleared before each sync.
-  # Keep trial runs separate from an existing page-based export.
-  local_sync_dir: "./confluence-sync-spaces",
+  local_sync_dir: "./confluence",
 
   # Always sync every accessible current page, including all nested subpages.
   # Use each space's full Confluence name as its folder and its homepage as index.md.

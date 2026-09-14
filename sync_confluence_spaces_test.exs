@@ -161,6 +161,8 @@ defmodule SyncConfluenceTest do
     File.mkdir_p!(output)
     File.write!(Path.join(output, "keep.txt"), "Existing export")
     trial = Path.join(output, "trial")
+    File.mkdir_p!(Path.join(trial, "old-export"))
+    File.write!(Path.join(trial, "old-export/removed.md"), "Stale page")
     log = capture_io(fn -> SyncConfluence.main(config, ["--out", trial]) end)
 
     expected = %{
@@ -199,6 +201,7 @@ defmodule SyncConfluenceTest do
              "https://confluence.test/wiki/spaces/PED/pages/1"
 
     assert File.read!(Path.join(output, "keep.txt")) == "Existing export"
+    refute File.exists?(Path.join(trial, "old-export"))
     assert log =~ "Written: 11"
     assert log =~ "Space PED: 10 pages written in"
     assert log =~ "Duration:"

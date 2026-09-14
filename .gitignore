@@ -1,5 +1,6 @@
 sync_confluence.local.exs
 sync_confluence_spaces.local.exs
+/confluence/
 /confluence-sync/
 /confluence-sync-spaces/
 /tmp/

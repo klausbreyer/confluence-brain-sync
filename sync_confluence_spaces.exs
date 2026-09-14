@@ -43,7 +43,7 @@ config = %{
     fetch_config.(:confluence_email, "you@example.com") |> to_string() |> String.trim(),
   confluence_api_token:
     fetch_config.(:confluence_api_token, "replace-me") |> to_string() |> String.trim(),
-  local_sync_dir: fetch_config.(:local_sync_dir, "./confluence-sync-spaces") |> to_string(),
+  local_sync_dir: fetch_config.(:local_sync_dir, "./confluence") |> to_string(),
   sync_targets: fetch_config.(:sync_targets, [])
 }
 

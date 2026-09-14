@@ -1,13 +1,13 @@
 TARGET_DIR ?= $(HOME)/vault/v01/myo
-SCRIPT_NAME := sync_confluence.exs
-CONFIG_NAME := sync_confluence.local.exs
+SCRIPT_NAME := sync_confluence_spaces.exs
+CONFIG_NAME := sync_confluence_spaces.local.exs
 
-.PHONY: deploy test
+.PHONY: deploy-spaces test
 
 test:
-	elixir sync_confluence_test.exs
+	elixir sync_confluence_spaces_test.exs
 
-deploy:
+deploy-spaces:
 	mkdir -p "$(TARGET_DIR)"
 	cp -f "$(SCRIPT_NAME)" "$(TARGET_DIR)/$(SCRIPT_NAME)"
 	@echo "Copied $(SCRIPT_NAME) to $(TARGET_DIR)/$(SCRIPT_NAME)"

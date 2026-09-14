@@ -3,10 +3,10 @@ Mix.install([
   {:floki, "~> 0.37"}
 ])
 
-config_file_name = "sync_confluence.local.exs"
+config_file_name = "sync_confluence_spaces.local.exs"
 script_dir = __ENV__.file |> Path.expand() |> Path.dirname()
 config_file_path = Path.join(script_dir, config_file_name)
-example_config_file_path = Path.join(script_dir, "sync_confluence.local.example.exs")
+example_config_file_path = Path.join(script_dir, "sync_confluence_spaces.local.example.exs")
 
 raw_config =
   cond do
@@ -1331,7 +1331,7 @@ defmodule SyncConfluence do
         raise """
         Missing config file: #{config.config_file_path}
 
-        Create it next to sync_confluence.exs. You can start from:
+        Create it next to sync_confluence_spaces.exs. You can start from:
         #{config.example_config_file_path}
         """
 
@@ -1352,7 +1352,7 @@ defmodule SyncConfluence do
   defp usage(config) do
     IO.puts("""
     Usage:
-      elixir sync_confluence.exs [--space <space-url-or-key> ...] [--out <dir>] [--verbose]
+      elixir sync_confluence_spaces.exs [--space <space-url-or-key> ...] [--out <dir>] [--verbose]
 
     Config file:
       #{config.config_file_path}

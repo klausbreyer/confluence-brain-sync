@@ -3,7 +3,7 @@ ExUnit.start()
 # Load the standalone script through its read-only help entry point.
 original_argv = System.argv()
 System.argv(["--help"])
-ExUnit.CaptureIO.capture_io(fn -> Code.require_file("sync_confluence.exs", __DIR__) end)
+ExUnit.CaptureIO.capture_io(fn -> Code.require_file("sync_confluence_spaces.exs", __DIR__) end)
 System.argv(original_argv)
 
 defmodule SyncConfluenceTest do
@@ -37,7 +37,7 @@ defmodule SyncConfluenceTest do
       local_sync_dir: output,
       sync_targets: [],
       config_file_exists?: true,
-      config_file_name: "sync_confluence.local.exs"
+      config_file_name: "sync_confluence_spaces.local.exs"
     }
 
     {:ok, config: config, output: output}

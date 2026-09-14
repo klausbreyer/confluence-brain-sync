@@ -67,7 +67,7 @@ defmodule SyncConfluenceTest do
     end
   end
 
-  test "exports all roots, nested pages and containers across pagination into separate space folders",
+  test "exports all roots, nested pages and containers across pagination without duplicate space and homepage folders",
        %{config: config, output: output} do
     pages = [
       page("1", "Home"),
@@ -103,7 +103,19 @@ defmodule SyncConfluenceTest do
       body =
         case {request.method, path} do
           {:get, "/wiki/api/v2/spaces"} ->
-            results([%{"id" => query["keys"], "key" => query["keys"], "homepageId" => "1"}])
+            {name, homepage_id} =
+              if query["keys"] == "PED",
+                do: {"Product Engineering & Design", "1"},
+                else: {"Private space", "20"}
+
+            results([
+              %{
+                "id" => query["keys"],
+                "key" => query["keys"],
+                "name" => name,
+                "homepageId" => homepage_id
+              }
+            ])
 
           {:get, "/wiki/api/v2/spaces/PED/pages"} ->
             if query["cursor"] == "second" do
@@ -152,17 +164,17 @@ defmodule SyncConfluenceTest do
     log = capture_io(fn -> SyncConfluence.main(config, ["--out", trial]) end)
 
     expected = %{
-      "PED/Home/index.md" => "1",
-      "PED/Home/Child.md" => "2",
-      "PED/Other root/index.md" => "3",
-      "PED/Other root/Nested.md" => "4",
-      "PED/Home/Outer/Inner/Deep.md" => "5",
-      "PED/Home/index (6).md" => "6",
-      "PED/Home/Outer/Inner/Peer.md" => "7",
-      "PED/Link/Database/Board/Beyond whiteboard.md" => "8",
-      "PED/Home/Notes (9).md" => "9",
-      "PED/Home/notes (10).md" => "10",
-      "Privat/Private home.md" => "20"
+      "Product Engineering & Design/index.md" => "1",
+      "Product Engineering & Design/Child.md" => "2",
+      "Product Engineering & Design/Other root/index.md" => "3",
+      "Product Engineering & Design/Other root/Nested.md" => "4",
+      "Product Engineering & Design/Outer/Inner/Deep.md" => "5",
+      "Product Engineering & Design/index (6).md" => "6",
+      "Product Engineering & Design/Outer/Inner/Peer.md" => "7",
+      "Product Engineering & Design/Link/Database/Board/Beyond whiteboard.md" => "8",
+      "Product Engineering & Design/Notes (9).md" => "9",
+      "Product Engineering & Design/notes (10).md" => "10",
+      "Private space/index.md" => "20"
     }
 
     actual =
@@ -178,12 +190,12 @@ defmodule SyncConfluenceTest do
 
       assert markdown =~
                if(id == "2",
-                 do: "[Other](../Other%20root/Nested.md#section)",
+                 do: "[Other](Other%20root/Nested.md#section)",
                  else: "Exported #{id}"
                )
     end
 
-    assert File.read!(Path.join(trial, "PED/Home/index.md")) =~
+    assert File.read!(Path.join(trial, "Product Engineering & Design/index.md")) =~
              "https://confluence.test/wiki/spaces/PED/pages/1"
 
     assert File.read!(Path.join(output, "keep.txt")) == "Existing export"
@@ -192,6 +204,63 @@ defmodule SyncConfluenceTest do
     assert log =~ "Duration:"
     calls = Agent.get(requests, & &1)
     assert Enum.count(calls, fn {_, path, _} -> path == "/wiki/api/v2/folders/11" end) == 1
+  end
+
+  test "equal space names and homepage children colliding with other roots preserve every page",
+       %{
+         config: config,
+         output: output
+       } do
+    stub(fn request ->
+      case request.url.path do
+        "/wiki/api/v2/spaces" ->
+          key = URI.decode_query(request.url.query)["keys"]
+          id = if key == "PED", do: "100", else: "200"
+
+          {200,
+           results([%{"id" => id, "key" => key, "name" => "Shared", "homepageId" => id <> "1"}])}
+
+        "/wiki/api/v2/spaces/" <> rest ->
+          [space_id, "pages"] = String.split(rest, "/")
+          {200, results(Enum.map(1..3, &%{"id" => space_id <> to_string(&1)}))}
+
+        "/wiki/api/v2/pages/" <> id ->
+          case String.last(id) do
+            "1" -> {200, page(id, "Different homepage name")}
+            "2" -> {200, page(id, "Guide", String.slice(id, 0..2) <> "1")}
+            "3" -> {200, page(id, "Guide")}
+          end
+
+        "/wiki/rest/api/contentbody/convert/async/export_view" ->
+          {200, %{"asyncId" => URI.decode_query(request.url.query)["contentIdContext"]}}
+
+        "/wiki/rest/api/contentbody/convert/async/" <> id ->
+          {200, %{"value" => "<p>Page #{id}</p>"}}
+      end
+    end)
+
+    capture_io(fn ->
+      SyncConfluence.main(
+        %{
+          config
+          | sync_targets: [
+              %{source: "PED", output_dir: "../old-setting"},
+              %{source: "FFP", output_dir: "../old-setting"}
+            ]
+        },
+        []
+      )
+    end)
+
+    assert Enum.sort(File.ls!(output)) == ["Shared (100)", "Shared (200)"]
+
+    for space_id <- ["100", "200"] do
+      directory = Path.join(output, "Shared (#{space_id})")
+      assert File.read!(Path.join(directory, "index.md")) =~ "Page #{space_id}1"
+      assert File.read!(Path.join(directory, "Guide (#{space_id}2).md")) =~ "Page #{space_id}2"
+      assert File.read!(Path.join(directory, "Guide (#{space_id}3).md")) =~ "Page #{space_id}3"
+      assert length(File.ls!(directory)) == 3
+    end
   end
 
   test "page and folder names cannot overwrite each other or a generated index", %{
@@ -342,17 +411,16 @@ defmodule SyncConfluenceTest do
   end
 
   test "unknown spaces and authorization errors fail explicitly", %{config: config} do
-    target = %{id: "space:PED", space_key: "PED", output_dir: "PED"}
     stub(fn _request -> {200, results([])} end)
-    assert {:error, reason} = Client.fetch_space_target_tree(Client.new(config), target, false)
+    assert {:error, reason} = Client.fetch_space(Client.new(config), "PED", false)
     assert reason =~ "not found or is not accessible"
 
     stub(fn _request -> {401, %{"message" => "Unauthorized"}} end)
-    assert {:error, reason} = Client.fetch_space_target_tree(Client.new(config), target, false)
+    assert {:error, reason} = Client.fetch_space(Client.new(config), "PED", false)
     assert reason =~ "HTTP 401"
   end
 
-  test "invalid output folders and page targets fail before clearing output", %{
+  test "invalid page targets fail before clearing output", %{
     config: config,
     output: output
   } do
@@ -361,10 +429,6 @@ defmodule SyncConfluenceTest do
     File.write!(marker, "Keep")
 
     for targets <- [
-          [%{source: "PED", output_dir: "../outside"}],
-          [%{source: "PED", output_dir: "."}],
-          [%{source: "PED", output_dir: ""}],
-          [%{source: "PED", output_dir: "Same"}, %{source: "FFP", output_dir: "same"}],
           [%{source: "PED", include_children: false}],
           ["https://confluence.test/wiki/spaces/PED/pages/1/Home"],
           []

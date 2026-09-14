@@ -219,8 +219,9 @@ defmodule SyncConfluence.Client do
   end
 
   def fetch_space_target_tree(client, target, verbose) do
-    with {:ok, space} <- fetch_space(client, target.space_key, verbose),
-         {:ok, listed_pages} <-
+    space = target.space
+
+    with {:ok, listed_pages} <-
            paginate_json(
              client,
              "/wiki/api/v2/spaces/#{space["id"]}/pages",
@@ -254,7 +255,7 @@ defmodule SyncConfluence.Client do
     end
   end
 
-  defp fetch_space(client, key, verbose) do
+  def fetch_space(client, key, verbose) do
     with {:ok, spaces} <-
            paginate_json(client, "/wiki/api/v2/spaces", [keys: key, limit: 250], verbose) do
       # Renamed spaces keep their original key; URLs use the current alias.
@@ -536,9 +537,10 @@ defmodule SyncConfluence.Client do
     %{
       id: target.id,
       type: "space",
-      title: target.output_dir,
+      title: target.space["name"] || target.space_key,
       parent_id: nil,
       root_parent_id: target.id,
+      homepage_id: target.space["homepageId"],
       output_dir: target.output_dir
     }
   end
@@ -554,39 +556,11 @@ defmodule SyncConfluence.Tree do
       nodes
       |> Enum.group_by(& &1.root_parent_id)
 
-    page_counts_by_root =
-      nodes
-      |> Enum.filter(&(&1.type == "page"))
-      |> Enum.frequencies_by(& &1.root_parent_id)
-
-    root_dirs =
-      roots
-      |> Enum.map(fn root ->
-        page_count = Map.get(page_counts_by_root, root.id, 0)
-        configured_output_dir = Map.get(root, :output_dir)
-
-        relative_dir =
-          cond do
-            configured_output_dir not in [nil, ""] ->
-              configured_output_dir
-
-            page_count > 1 ->
-              Util.slugify(root.title)
-
-            true ->
-              ""
-          end
-
-        {root.id, relative_dir}
-      end)
-      |> Map.new()
-
     nodes_with_dirs =
       roots
       |> Enum.flat_map(fn root ->
-        root_dir = Map.fetch!(root_dirs, root.id)
         root_nodes = Map.fetch!(nodes_by_root, root.id)
-        assign_paths_for_root(root, root_nodes, root_dir)
+        assign_paths_for_root(root, root_nodes, root.output_dir)
       end)
 
     page_paths =
@@ -625,21 +599,41 @@ defmodule SyncConfluence.Tree do
     end)
   end
 
+  def space_directory_names(targets) do
+    targets
+    |> Enum.map(fn target ->
+      %{id: target.space["id"], title: target.space["name"] || target.space_key}
+    end)
+    |> assign_directory_names([])
+  end
+
   defp assign_paths_for_root(root, root_nodes, root_dir) do
+    homepage = Enum.find(root_nodes, &(&1.type == "page" and &1.id == root.homepage_id))
+    homepage_id = if homepage, do: homepage.id
+
+    # The homepage is the space's index. Its children and other top-level pages
+    # share the space directory, including the same filename collision checks.
     children_by_parent =
       root_nodes
-      |> Enum.reject(&(&1.id == root.id))
-      |> Enum.group_by(& &1.parent_id)
-
-    root_has_children? = Map.has_key?(children_by_parent, root.id)
+      |> Enum.reject(&(&1.id == root.id or &1.id == homepage_id))
+      |> Enum.group_by(fn node ->
+        if homepage && node.parent_id == homepage_id, do: root.id, else: node.parent_id
+      end)
 
     root_with_paths =
       root
       |> Map.put(:relative_dir, root_dir)
-      |> Map.put(:is_container, root_has_children?)
+      |> Map.put(:is_container, true)
       |> Map.put(:relative_path, root_dir)
 
-    [root_with_paths | assign_child_paths(root, children_by_parent, root_dir)]
+    homepage_nodes =
+      if homepage do
+        [homepage |> Map.put(:relative_dir, root_dir) |> Map.put(:is_container, true)]
+      else
+        []
+      end
+
+    [root_with_paths | homepage_nodes ++ assign_child_paths(root, children_by_parent, root_dir)]
   end
 
   defp assign_child_paths(parent, children_by_parent, current_dir) do
@@ -1126,6 +1120,7 @@ defmodule SyncConfluence do
 
     Logger.log("Local output directory: #{output_dir}", true)
 
+    targets = resolve_spaces!(client, targets, verbose)
     reset_directory!(output_dir)
     summary = run_spaces_sync(client, targets, output_dir, verbose)
 
@@ -1134,6 +1129,34 @@ defmodule SyncConfluence do
     IO.puts("Output directory: #{output_dir}")
     IO.puts("Written: #{summary.written}")
     IO.puts("Duration: #{format_duration(System.monotonic_time(:millisecond) - started_at)}")
+  end
+
+  defp resolve_spaces!(client, targets, verbose) do
+    targets =
+      targets
+      |> Task.async_stream(
+        fn target ->
+          case Client.fetch_space(client, target.space_key, verbose) do
+            {:ok, space} -> {:ok, Map.put(target, :space, space)}
+            {:error, reason} -> {:error, reason}
+          end
+        end,
+        max_concurrency: @target_concurrency,
+        ordered: false,
+        timeout: :infinity
+      )
+      |> Enum.map(fn
+        {:ok, {:ok, target}} -> target
+        {:ok, {:error, reason}} -> raise reason
+        {:exit, reason} -> raise "Space lookup task failed: #{inspect(reason)}"
+      end)
+      |> Enum.uniq_by(& &1.space["id"])
+
+    directory_names = Tree.space_directory_names(targets)
+
+    Enum.map(targets, fn target ->
+      Map.put(target, :output_dir, Map.fetch!(directory_names, target.space["id"]))
+    end)
   end
 
   defp run_spaces_sync(client, targets, output_dir, verbose) do
@@ -1192,14 +1215,7 @@ defmodule SyncConfluence do
       raise "Define spaces in sync_targets in #{config.config_file_name} or pass --space on the command line."
     end
 
-    targets = sources |> Enum.map(&normalize_target!/1) |> Enum.uniq_by(& &1.space_key)
-    directory_names = Enum.map(targets, &String.downcase(&1.output_dir))
-
-    if length(Enum.uniq(directory_names)) != length(directory_names) do
-      raise "Each space must have a separate output_dir."
-    end
-
-    targets
+    sources |> Enum.map(&normalize_target!/1) |> Enum.uniq_by(& &1.space_key)
   end
 
   defp normalize_target!(source) when is_binary(source), do: normalize_target!(%{source: source})
@@ -1219,17 +1235,10 @@ defmodule SyncConfluence do
         {:error, reason} -> raise reason
       end
 
-    output_dir = target_value(target, :output_dir, Util.safe_file_stem(space_key))
-
-    if not is_binary(output_dir) or output_dir != Util.safe_file_stem(output_dir) do
-      raise "Each output_dir must be a single folder name inside local_sync_dir."
-    end
-
     %{
       id: "space:#{space_key}",
       source: source,
-      space_key: space_key,
-      output_dir: output_dir
+      space_key: space_key
     }
   end
 
@@ -1364,8 +1373,10 @@ defmodule SyncConfluence do
     Notes:
       - Put credentials and defaults into #{config.config_file_name}, next to this script.
       - You can start from #{Path.basename(config.example_config_file_path)}.
-      - Define sync_targets as space URLs/keys or maps with source and optional output_dir.
-      - Each space gets its own top-level folder, named after its key unless output_dir is set.
+      - Define sync_targets as space URLs/keys or maps with source.
+      - Each space gets one folder named after its full Confluence name, directly inside the output.
+      - The space homepage is index.md in that folder, without an extra homepage directory.
+      - Older output_dir settings in sync_targets are ignored; no config migration is needed.
       - --space replaces configured targets; repeat it to sync multiple spaces.
       - All accessible current pages are included, at every depth and outside the homepage tree.
       - Personal space URLs work too; homepageId and other query parameters are ignored.

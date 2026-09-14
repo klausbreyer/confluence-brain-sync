@@ -257,7 +257,8 @@ defmodule SyncConfluence.Client do
   defp fetch_space(client, key, verbose) do
     with {:ok, spaces} <-
            paginate_json(client, "/wiki/api/v2/spaces", [keys: key, limit: 250], verbose) do
-      case Enum.find(spaces, &(&1["key"] == key)) do
+      # Renamed spaces keep their original key; URLs use the current alias.
+      case Enum.find(spaces, &(&1["key"] == key or &1["currentActiveAlias"] == key)) do
         nil -> {:error, "Space #{key} was not found or is not accessible with these credentials."}
         space -> {:ok, space}
       end

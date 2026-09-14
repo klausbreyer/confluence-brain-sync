@@ -306,6 +306,41 @@ defmodule SyncConfluenceTest do
     assert log =~ "Written: 2"
   end
 
+  test "renamed spaces resolve by active alias and use their stable ID", %{
+    config: config,
+    output: output
+  } do
+    stub(fn request ->
+      case request.url.path do
+        "/wiki/api/v2/spaces" ->
+          assert URI.decode_query(request.url.query)["keys"] == "PED"
+
+          {200,
+           results([
+             %{"id" => "other", "key" => "OTHER", "currentActiveAlias" => "OTHER"},
+             %{"id" => "stable-id", "key" => "PTD", "currentActiveAlias" => "PED"}
+           ])}
+
+        "/wiki/api/v2/spaces/stable-id/pages" ->
+          {200, results([page("1", "Home")])}
+
+        "/wiki/api/v2/pages/1" ->
+          {200, page("1", "Home")}
+
+        "/wiki/rest/api/contentbody/convert/async/export_view" ->
+          {200, %{"asyncId" => "1"}}
+
+        "/wiki/rest/api/contentbody/convert/async/1" ->
+          {200, %{"value" => "<p>Alias resolved</p>"}}
+      end
+    end)
+
+    log = capture_io(fn -> SyncConfluence.main(%{config | sync_targets: ["PED"]}, []) end)
+    assert File.read!(Path.join(output, "PED/Home.md")) =~ "Alias resolved"
+    refute File.exists?(Path.join(output, "PTD"))
+    assert log =~ "Written: 1"
+  end
+
   test "unknown spaces and authorization errors fail explicitly", %{config: config} do
     target = %{id: "space:PED", space_key: "PED", output_dir: "PED"}
     stub(fn _request -> {200, results([])} end)

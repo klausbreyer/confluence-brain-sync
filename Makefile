@@ -1,4 +1,4 @@
-TARGET_DIR ?= $(HOME)/vault/v01/myo
+TARGET_DIR ?= $(HOME)/vault/myo
 SCRIPT_NAME := sync_confluence.exs
 CONFIG_NAME := sync_confluence.local.exs
 

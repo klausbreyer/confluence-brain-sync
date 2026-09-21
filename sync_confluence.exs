@@ -314,6 +314,9 @@ defmodule SyncConfluence.Client do
            parent_type: body["parentType"],
            space_id: body["spaceId"],
            version: get_in(body, ["version", "number"]),
+           author: body["authorId"],
+           created_at: body["createdAt"],
+           updated_at: get_in(body, ["version", "createdAt"]),
            storage_value: get_in(body, ["body", "storage", "value"]) || "",
            source_url: source_url(client.base_url, body["id"], body["_links"] || %{})
          }}
@@ -349,6 +352,44 @@ defmodule SyncConfluence.Client do
 
       {:exit, reason}, _acc ->
         {:halt, {:error, "Page body fetch task failed: #{inspect(reason)}"}}
+    end)
+    |> resolve_authors(client)
+  end
+
+  defp resolve_authors({:error, _} = error, _client), do: error
+
+  # Look up each original creator once per target, in batches allowed by the API.
+  # Keep the account ID when a profile is unavailable so page exports still work.
+  defp resolve_authors(pages, client) do
+    authors =
+      pages
+      |> Map.values()
+      |> Enum.map(& &1.author)
+      |> Enum.reject(&(&1 in [nil, ""]))
+      |> Enum.uniq()
+      |> Enum.chunk_every(250)
+      |> Enum.reduce(%{}, fn account_ids, acc ->
+        case request_json(client, :post, "/wiki/api/v2/users-bulk",
+               json: %{"accountIds" => account_ids}
+             ) do
+          {:ok, %{"results" => users}, _response} ->
+            Enum.reduce(users, acc, fn user, names ->
+              case user["displayName"] do
+                name when is_binary(name) and name != "" ->
+                  Map.put(names, user["accountId"], name)
+
+                _ ->
+                  names
+              end
+            end)
+
+          _ ->
+            acc
+        end
+      end)
+
+    Map.new(pages, fn {id, page} ->
+      {id, %{page | author: Map.get(authors, page.author, page.author)}}
     end)
   end
 
@@ -1058,6 +1099,9 @@ defmodule SyncConfluence.Writer do
       "parent_page_id" => if(page.parent_type == "page", do: page.parent_id, else: nil),
       "source_url" => page.source_url,
       "version" => page.version,
+      "author" => page.author,
+      "created_at" => page.created_at,
+      "updated_at" => page.updated_at,
       "status" => "active"
     }
 

@@ -18,3 +18,5 @@ deploy deploy-spaces:
 
 test:
 	elixir sync_confluence_spaces_test.exs
+	elixir sync_confluence_metadata_test.exs sync_confluence.exs
+	elixir sync_confluence_metadata_test.exs sync_confluence_spaces.exs
